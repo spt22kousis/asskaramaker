@@ -22,6 +22,11 @@ def test_space_syllable_is_gap_but_trailing_space_is_not():
     assert [s.is_gap for s in k.syls] == [False, False, False, False, False, True, False]
 
 
+def test_punctuation_only_syllables_are_gaps():
+    k = KaraLine.parse('{\\k1}「{\\k1}初|<はつ{\\k1}ク！{\\k1}！{\\k1} {\\k1}&{\\k1}「♡」{\\k1}9|<きゅー{\\k1}"{\\k1}……')
+    assert [s.is_gap for s in k.syls] == [True, False, False, True, True, False, False, False, True, True]
+
+
 def test_notebook_empty_syllables_are_gaps():
     k = KaraLine.parse(NOTEBOOK)
     assert [s.text for s in k.syls] == ["新作動画|<しんさくどうが", "", "投稿|<とうこう", "", "だ", ""]

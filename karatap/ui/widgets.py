@@ -23,6 +23,28 @@ WARN = QColor("#ff5c5c")
 EDIT = QColor("#c58cff")
 
 
+def split_punct(text: str) -> tuple[str, str, str]:
+    """'唱！' -> ('', '唱', '！'): punctuation glued to a kanji doesn't get furigana over it."""
+    i, j = 0, len(text)
+    while i < j and not text[i].isalnum():
+        i += 1
+    while j > i and not text[j - 1].isalnum():
+        j -= 1
+    if i == j:
+        return "", text, ""
+    return text[:i], text[i:j], text[j:]
+
+
+def ruby_layout(base: str, ruby_w: float, bm: QFontMetricsF) -> tuple[float, float, float]:
+    """Place furigana over the kanji only. Returns (unit width, base x offset, ruby x offset)."""
+    lead, core, _ = split_punct(base)
+    lw, cw = bm.horizontalAdvance(lead), bm.horizontalAdvance(core)
+    base_x = max(0.0, ruby_w / 2 - lw - cw / 2)
+    center = base_x + lw + cw / 2
+    width = max(base_x + bm.horizontalAdvance(base), center + ruby_w / 2)
+    return width, base_x, center - ruby_w / 2
+
+
 def jp_font(px: float, bold: bool = True) -> QFont:
     f = QFont()
     f.setFamilies(JP_FONTS)
@@ -102,9 +124,8 @@ class CueWidget(QWidget):
             x += w + size * 0.5
 
     def _item_width(self, it: CueItem, size: float) -> float:
-        bw = QFontMetricsF(jp_font(size)).horizontalAdvance(it.base)
         rw = QFontMetricsF(jp_font(size * 0.4)).horizontalAdvance("".join(it.ruby_parts))
-        return max(bw, rw)
+        return ruby_layout(it.base, rw, QFontMetricsF(jp_font(size)))[0]
 
     def _draw_item(self, p: QPainter, it: CueItem, cx: float, baseline: float, size: float,
                    main: bool, dim_level: int = 0) -> QRectF:
@@ -124,7 +145,8 @@ class CueWidget(QWidget):
             rf = jp_font(size * 0.4)
             rm = QFontMetricsF(rf)
             total = sum(rm.horizontalAdvance(s) for s in it.ruby_parts)
-            x = cx - total / 2
+            lead, core, _ = split_punct(it.base)
+            x = base_rect.left() + bm.horizontalAdvance(lead) + bm.horizontalAdvance(core) / 2 - total / 2
             y = base_rect.top() - rm.descent()
             p.setFont(rf)
             for k, part in enumerate(it.ruby_parts):
@@ -243,8 +265,9 @@ class LineView(QWidget):
         while True:
             bf, rf = jp_font(size), jp_font(size * 0.45)
             bm, rm = QFontMetricsF(bf), QFontMetricsF(rf)
-            widths = [max(bm.horizontalAdvance(u.base), sum(rm.horizontalAdvance(t) for t, _ in u.ruby))
-                      for u in units]
+            layouts = [ruby_layout(u.base, sum(rm.horizontalAdvance(t) for t, _ in u.ruby), bm)
+                       for u in units]
+            widths = [l[0] for l in layouts]
             total = sum(widths)
             if total <= width or size < 8:
                 break
@@ -269,20 +292,19 @@ class LineView(QWidget):
 
         spots: list[EditSpot] = []
         kara = line.kara
-        for n, (u, w) in enumerate(zip(units, widths)):
+        for n, (u, (w, base_x, ruby_x)) in enumerate(zip(units, layouts)):
             bw = bm.horizontalAdvance(u.base)
             col = colour(u.base_syls)
             p.setFont(bf)
             p.setPen(col)
-            rect = QRectF(x + (w - bw) / 2, baseline - bm.ascent(), bw, bm.height())
+            rect = QRectF(x + base_x, baseline - bm.ascent(), bw, bm.height())
             p.drawText(rect, Qt.AlignCenter, u.base)
             if main and any(states.get(s) == "next" for s in u.base_syls[:1]):
                 p.setPen(QPen(NEXT, 2))
                 y = rect.bottom() - 2
                 p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
             if u.ruby:
-                rw = sum(rm.horizontalAdvance(t) for t, _ in u.ruby)
-                rx = x + (w - rw) / 2
+                rx = x + ruby_x
                 p.setFont(rf)
                 for j, (text, si) in enumerate(u.ruby):
                     tw = rm.horizontalAdvance(text)

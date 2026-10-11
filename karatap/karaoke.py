@@ -8,12 +8,19 @@ Text is never modified; rewriting only replaces tag numbers and inserts new
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
 KTAG_RE = re.compile(r"\\(kf|ko|k|K)(\d+)")
 _INVISIBLE_RE = re.compile(r"\\[Nnh]")
 _SIMPLE_SPAN = re.compile(r"^\{\\(kf|ko|k|K)(\d+)\}([^{}]*)$")
 SMALL_KANA = set("ぁぃぅぇぉゃゅょゎァィゥェォャュョヮ")
+SUNG_PUNCT = set("&＆")
+
+
+def _is_filler(ch: str) -> bool:
+    """Characters that are never sung on their own: whitespace and punctuation."""
+    return ch.isspace() or (unicodedata.category(ch).startswith("P") and ch not in SUNG_PUNCT)
 OPENING = set("「『（(“‘【〈《")
 _ASCII_WORD = re.compile(r"[A-Za-z]")
 
@@ -35,8 +42,13 @@ class Syllable:
 
     @property
     def is_gap(self) -> bool:
-        """Empty or whitespace-only syllables are gaps: never tapped, filled by the tool."""
-        return _INVISIBLE_RE.sub("", self.text).strip() == ""
+        """Gaps are never tapped; the tool fills their time.
+
+        A syllable is a gap when its text is empty or only spaces and
+        punctuation (！ 「 " …). '&' is sung ("and") and symbols such as ♡
+        may be sung, so those stay tappable.
+        """
+        return all(_is_filler(ch) for ch in _INVISIBLE_RE.sub("", self.text))
 
 
 @dataclass
