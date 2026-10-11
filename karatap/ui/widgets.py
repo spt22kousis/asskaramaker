@@ -172,7 +172,7 @@ def line_units(line: LineInfo) -> list[Unit]:
 class EditSpot:
     x: float
     row: str          # 'base' or 'ruby'
-    kind: str         # 'merge' (an existing boundary) or 'split' (a possible one)
+    kind: str         # 'merge' (boundary that can be joined), 'fixed' (can't), 'split' (possible cut)
     syl: int
     at: int = 0       # split: piece index inside the syllable
 
@@ -289,16 +289,16 @@ class LineView(QWidget):
                     p.setPen(colour([si]))
                     p.drawText(QRectF(rx, rect.top() - rm.height(), tw, rm.height()), Qt.AlignCenter, text)
                     if main:
-                        if j and merge_syllables(kara, u.ruby[j - 1][1]) is not None:
-                            spots.append(EditSpot(rx, "ruby", "merge", u.ruby[j - 1][1]))
+                        if j:
+                            spots.append(self._boundary(kara, u.ruby[j - 1][1], rx, "ruby"))
                         spots += self._split_spots(kara, si, rx, rm, "ruby")
                     rx += tw
             elif main and len(u.base_syls) == 1:
                 spots += self._split_spots(kara, u.base_syls[0], rect.left(), bm, "base")
             if main and n + 1 < len(units) and u.base_syls and units[n + 1].base_syls:
                 a, b = u.base_syls[-1], units[n + 1].base_syls[0]
-                if b == a + 1 and merge_syllables(kara, a) is not None:
-                    spots.append(EditSpot(x + w, "base", "merge", a))
+                if b == a + 1:
+                    spots.append(self._boundary(kara, a, x + w, "base"))
             x += w
 
         if main:
@@ -307,6 +307,12 @@ class LineView(QWidget):
             self._hit = size * 0.45
             if self.edit_enabled:
                 self._draw_spots(p, spots, baseline, bm, rm)
+
+    @staticmethod
+    def _boundary(kara, si: int, x: float, row: str) -> EditSpot:
+        """Boundary after syllable si: 'merge' if the two can be joined, else 'fixed'."""
+        kind = "merge" if merge_syllables(kara, si) is not None else "fixed"
+        return EditSpot(x, row, kind, si)
 
     @staticmethod
     def _split_spots(kara, si: int, x0: float, fm: QFontMetricsF, row: str) -> list[EditSpot]:
@@ -326,8 +332,8 @@ class LineView(QWidget):
                 y0, y1 = base_top + bm.height() * 0.15, baseline + bm.descent() * 0.6
             else:
                 y0, y1 = base_top - rm.height() * 0.95, base_top - rm.height() * 0.1
-            if s.kind == "merge":
-                p.setPen(QPen(EDIT, 2))
+            if s.kind in ("merge", "fixed"):
+                p.setPen(QPen(EDIT if s.kind == "merge" else DIM, 2))
                 p.drawLine(QPointF(s.x, y0), QPointF(s.x, y1))
             else:
                 p.setPen(Qt.NoPen)

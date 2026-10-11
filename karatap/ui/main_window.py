@@ -28,7 +28,7 @@ HELP = """打軸鍵：{taps}（可多鍵交替／雙押）　結束鍵：{end}
 空白：播放／暫停　←／→：倒退／前進 2 秒
 R：重敲本行　Backspace：復原上一下　↑／↓：上一行／下一行　Ctrl+G：跳到第幾行
 M：長按／起點模式　S：切換速度　P：保持音高　C：逐行／連續　T：行時間模式
-E：延長選取行的行時間（敲出界時）　暫停時點目前那行字與字之間：切開／合併音節（紫線＝現有分界，點＝可切開處）
+E：延長選取行的行時間（敲出界時）　暫停時點目前那行字與字之間：切開／合併音節（紫線＝可合併的分界，灰線＝不能合併的分界，點＝可切開處）
 Ctrl+S：存進度　Ctrl+E：匯出新 ASS　Ctrl+L：延遲校正　Ctrl+,：設定"""
 
 
@@ -488,7 +488,8 @@ class MainWindow(QMainWindow):
         kara = self.ctrl.lines[li].kara
         new = split_syllable(kara, syl, at) if kind == "split" else merge_syllables(kara, syl)
         if new is None:
-            self.statusBar().showMessage("這裡不能合併（振假名和一般文字不能放在同一個音節）", 3000)
+            self.statusBar().showMessage(
+                "這裡不能合併：振假名的語法表達不了（例如漢字＋一般文字、接續拍＋下一個漢字）", 4000)
             return
         if not self._confirm_clear(li):
             return
