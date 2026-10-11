@@ -23,7 +23,7 @@ class Settings:
     latency_ms: float = 0.0            # subtracted from every tap (calibration result)
     speeds: list[float] = field(default_factory=lambda: [1.0, 0.75, 0.5])
     speed: float = 1.0
-    keep_pitch: bool = True
+    keep_pitch: bool = False           # pitch-changing speed variants render in under a second
     compensate_stretch: bool = True    # correct the time-stretch filter's transient shift
     mode: str = HOLD
     line_timing: str = KEEP
