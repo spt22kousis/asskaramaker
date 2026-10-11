@@ -40,6 +40,7 @@ class Settings:
     last_template: str = ""            # new-project wizard: template ASS used last time
     last_dir: str = ""                 # ...and the folder media was last picked from
     help_open: bool = True             # full key help shown at the top of the tapping pages
+    snap_onsets: bool = False          # dragged boundaries snap to nearby onsets
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":

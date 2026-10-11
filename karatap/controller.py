@@ -26,6 +26,7 @@ LOOP_GRACE_MS = 1500     # line mode: replay the line if it ends this long witho
 SKIP_GRACE_MS = 300      # continuous mode: skip a line nobody touched once it is this far past its end
 IMPORT_MIN_FILL = 0.5    # a line's \k must cover this much of it to count as already timed
 DRAG_UNDO_LIMIT = 100
+MIN_LINE_MS = 100        # a dragged line keeps at least this length
 
 
 @dataclass
@@ -35,10 +36,15 @@ class LineInfo:
     kara: KaraLine
     furi: list[Furi]
     taps: list[int]          # indices of tappable syllables
+    added_key: str | None = None   # set for lines added in the tool (no event in the file)
 
     @property
     def key(self) -> str:
-        return str(self.event.line_no)
+        return self.added_key or str(self.event.line_no)
+
+    @property
+    def added(self) -> bool:
+        return self.added_key is not None
 
     @property
     def gaps(self) -> list[bool]:
@@ -56,9 +62,9 @@ class LineInfo:
                        for f, s in zip(self.furi, self.kara.syls) if not f.continuation)
 
 
-def make_line(idx: int, event: Event, text: str) -> LineInfo:
+def make_line(idx: int, event: Event, text: str, added_key: str | None = None) -> LineInfo:
     k = KaraLine.parse(text)
-    return LineInfo(idx, event, k, furigana_for(k), k.tappable())
+    return LineInfo(idx, event, k, furigana_for(k), k.tappable(), added_key)
 
 
 @dataclass
@@ -140,6 +146,7 @@ class Controller:
         self.settings = settings
         self.progress_path = progress_path
         evs = sorted(doc.karaoke_events(), key=lambda e: (e.start_ms, e.line_no))
+        self._first_event = evs[0] if evs else None
         self.lines: list[LineInfo] = []
         for e in evs:
             line = make_line(len(self.lines), e, e.text)
@@ -159,6 +166,10 @@ class Controller:
         self.layout_on = False
         self.layout_params = LayoutParams()
         self.layout_overrides: dict[int, tuple[int | None, int | None]] = {}   # manual start/end
+        # Lines removed in the tool (key -> original text) and the next key for an added line.
+        self.deleted: dict[str, str] = {}
+        self.next_added = 1
+        self.line_drag_history: list[tuple[int, tuple[float, float] | None]] = []
 
     # -- options -----------------------------------------------------------------
     def timing_options(self) -> TimingOptions:
@@ -172,6 +183,8 @@ class Controller:
         r = self.results.get(li)
         if r and r.start_override is not None:
             return r.start_override
+        if self.lines[li].added:
+            return self._added_span(li)[0]
         return self.lines[li].event.start_ms
 
     def line_end(self, li: int) -> float:
@@ -180,7 +193,22 @@ class Controller:
         r = self.results.get(li)
         if r and r.end_override is not None:
             return r.end_override
+        if self.lines[li].added:
+            return self._added_span(li)[1]
         return self.lines[li].event.end_ms
+
+    @staticmethod
+    def _gap_span(li: int, spans: list) -> tuple[float, float]:
+        """For a line without times: the gap between its timed neighbours."""
+        start = next((spans[k][1] for k in range(li - 1, -1, -1) if spans[k]), 0.0)
+        end = next((spans[k][0] for k in range(li + 1, len(spans)) if spans[k]), None)
+        return start, end if end is not None and end > start else start + 10000.0
+
+    def _added_span(self, li: int) -> tuple[float, float]:
+        own = self.sung_span(li)
+        if own:
+            return own
+        return self._gap_span(li, [self.sung_span(i) for i in range(len(self.lines))])
 
     # -- layout --------------------------------------------------------------------
     def sung_span(self, li: int) -> tuple[float, float] | None:
@@ -194,7 +222,7 @@ class Controller:
             return r.bounds[0][0], r.bounds[-1][1]
         if li in self.line_taps:
             return self.line_taps[li]
-        if not self.layout_on:
+        if not self.layout_on and not self.lines[li].added:
             ev = self.lines[li].event
             return float(ev.start_ms), float(ev.end_ms)
         return None
@@ -207,11 +235,20 @@ class Controller:
         p = pl[li]
         if p is None:
             # Not timed yet: assume it fills the gap between its timed neighbours.
-            start = next((pl[k].end for k in range(li - 1, -1, -1) if pl[k]), 0.0)
-            end = next((pl[k].start for k in range(li + 1, len(pl)) if pl[k]), None)
-            return start, end if end is not None and end > start else start + 10000.0
+            return self._gap_span(li, [(q.start, q.end) if q else None for q in pl])
         s, e = self.layout_overrides.get(li, (None, None))
         return (p.start if s is None else s), (p.end if e is None else e)
+
+    def display_spans(self) -> list[tuple[float, float, Placement] | None]:
+        """Every placed line's on-screen (start, end, placement), manual times applied."""
+        out = []
+        for li, p in enumerate(self.placements()):
+            if p is None:
+                out.append(None)
+                continue
+            s, e = self.layout_overrides.get(li, (None, None))
+            out.append((p.start if s is None else s, p.end if e is None else e, p))
+        return out
 
     def set_layout_override(self, li: int, start: int | None, end: int | None) -> None:
         if start is None and end is None:
@@ -248,7 +285,7 @@ class Controller:
         """Use \\k already in the ASS as the result of lines that have none. Returns how many."""
         n = 0
         for li, line in enumerate(self.lines):
-            if li in self.results or line.edited:
+            if li in self.results or line.edited or line.added:
                 continue
             b = file_bounds(line)
             if b:
@@ -349,7 +386,8 @@ class Controller:
     def edit_line(self, li: int, text: str) -> bool:
         """Replace line li's karaoke text (new syllable split). Returns True if its taps were cleared."""
         line = self.lines[li]
-        new = make_line(li, line.event, text)
+        ev = line.event.with_fields(text=text) if line.added else line.event
+        new = make_line(li, ev, text, line.added_key)
         if not new.taps:
             raise ValueError("a line needs at least one syllable to tap")
         self.lines[li] = new
@@ -361,6 +399,226 @@ class Controller:
     def revert_line(self, li: int) -> bool:
         """Back to the syllable split from the ASS file."""
         return self.edit_line(li, self.lines[li].event.text)
+
+    # -- editing the list of lines ---------------------------------------------------------
+    def _snapshot(self, li: int) -> tuple:
+        return (self.lines[li], self.results.get(li), self.line_taps.get(li),
+                self.layout_overrides.get(li))
+
+    def _restructure(self, items: list[tuple], cursor: int) -> None:
+        """Replace the line list; items are (line, result, line tap, layout override)."""
+        self.lines, self.results, self.line_taps, self.layout_overrides = [], {}, {}, {}
+        for i, (line, r, tap, ov) in enumerate(items):
+            line.idx = i
+            self.lines.append(line)
+            if r is not None:
+                self.results[i] = r
+            if tap is not None:
+                self.line_taps[i] = tap
+            if ov is not None:
+                self.layout_overrides[i] = ov
+        self.take = self.line_take = None
+        self.drag_history.clear()
+        self.line_drag_history.clear()
+        self.cursor = self.line_cursor = max(0, min(cursor, len(self.lines) - 1))
+        self.dirty = True
+
+    def _new_event(self, like: Event, text: str) -> Event:
+        """An event for a line added in the tool, shaped like `like`."""
+        changes = {"start": "0:00:00.00", "end": "0:00:00.00", "effect": "karaoke", "text": text}
+        ev = Event(-1, "Comment", like.head, list(like.fields), like.fmt)
+        return ev.with_fields(**{k: v for k, v in changes.items() if k in like.fmt})
+
+    def _added_line(self, like: Event, text: str) -> LineInfo:
+        line = make_line(0, self._new_event(like, text), text, f"n{self.next_added}")
+        if not line.taps:
+            raise ValueError("a line needs at least one syllable to tap")
+        self.next_added += 1
+        return line
+
+    def _forget(self, line: LineInfo) -> None:
+        if not line.added:
+            self.deleted[line.key] = line.event.text
+
+    def _own_span(self, li: int) -> tuple[float, float] | None:
+        r = self.results.get(li)
+        if r:
+            return r.bounds[0][0], r.bounds[-1][1]
+        return self.line_taps.get(li)
+
+    def delete_line(self, li: int) -> None:
+        if len(self.lines) <= 1:
+            raise ValueError("at least one line has to stay")
+        items = [self._snapshot(i) for i in range(len(self.lines)) if i != li]
+        self._forget(self.lines[li])
+        self._restructure(items, li)
+
+    def insert_line(self, after: int, text: str) -> int:
+        """Add a line after line `after` (-1: at the top). Returns its index."""
+        like = self.lines[max(0, after)].event
+        items = [self._snapshot(i) for i in range(len(self.lines))]
+        items.insert(after + 1, (self._added_line(like, text), None, None, None))
+        self._restructure(items, after + 1)
+        return after + 1
+
+    def replace_text(self, li: int, texts: list[str]) -> None:
+        """New lyrics for line li; more texts become new lines after it.
+
+        The line's syllable timing is dropped; its line tap and manual times stay.
+        """
+        line = self.lines[li]
+        ev = line.event.with_fields(text=texts[0]) if line.added else line.event
+        first = make_line(li, ev, texts[0], line.added_key)
+        if not first.taps:
+            raise ValueError("a line needs at least one syllable to tap")
+        items = [self._snapshot(i) for i in range(len(self.lines))]
+        items[li] = (first, None, self.line_taps.get(li), self.layout_overrides.get(li))
+        for k, text in enumerate(texts[1:]):
+            items.insert(li + 1 + k, (self._added_line(line.event, text), None, None, None))
+        self._restructure(items, li)
+
+    def split_options(self, li: int) -> list[tuple[int, str]]:
+        """Where line li can be split: (syllable index, '前半｜後半')."""
+        line = self.lines[li]
+        parts = [s.text if s.is_gap else ("" if f.continuation else f.base)
+                 for f, s in zip(line.furi, line.kara.syls)]
+        out = []
+        for k in range(1, len(parts)):
+            if line.furi[k].continuation:
+                continue
+            if any(t < k for t in line.taps) and any(t >= k for t in line.taps):
+                out.append((k, "".join(parts[:k]).rstrip() + "｜" + "".join(parts[k:]).lstrip()))
+        return out
+
+    def split_line(self, li: int, k: int) -> None:
+        """Split line li before syllable k; tapped syllable times go with their halves."""
+        line = self.lines[li]
+        pos = line.kara.insert_pos(k)
+        text_a, text_b = line.kara.text[:pos], line.kara.text[pos:]
+        ev_a = line.event.with_fields(text=text_a) if line.added else line.event
+        a = make_line(li, ev_a, text_a, line.added_key)
+        b = self._added_line(line.event, text_b)
+        if not a.taps:
+            raise ValueError("a line needs at least one syllable to tap")
+        n = len(a.taps)
+        r, tap = self.results.get(li), self.line_taps.get(li)
+        if r:
+            ra, rb = LineResult(list(r.bounds[:n])), LineResult(list(r.bounds[n:]))
+            ta, tb = (ra.bounds[0][0], ra.bounds[-1][1]), (rb.bounds[0][0], rb.bounds[-1][1])
+        else:
+            ra = rb = tb = None
+            ta = tap
+        items = [self._snapshot(i) for i in range(len(self.lines))]
+        items[li:li + 1] = [(a, ra, ta, None), (b, rb, tb, None)]
+        self._restructure(items, li)
+
+    def merge_loses_syllables(self, li: int) -> bool:
+        """Merging keeps syllable times only when both lines have them."""
+        return (li in self.results) != (li + 1 in self.results)
+
+    def merge_with_next(self, li: int) -> None:
+        """Join line li and the next one, a space syllable between them."""
+        a, b = self.lines[li], self.lines[li + 1]
+        edge_space = a.kara.syls[-1].text.endswith(" ") or b.kara.text.startswith(" ") \
+            or (b.kara.syls and b.kara.syls[0].text.startswith(" ") and not b.kara.prefix)
+        joiner = "" if edge_space else "{\\%s1} " % a.kara.syls[-1].tag
+        text = a.kara.text + joiner + b.kara.text
+        ev = a.event.with_fields(text=text) if a.added else a.event
+        merged = make_line(li, ev, text, a.added_key)
+        ra, rb = self.results.get(li), self.results.get(li + 1)
+        result = LineResult(list(ra.bounds) + list(rb.bounds)) if ra and rb else None
+        sa, sb = self._own_span(li), self._own_span(li + 1)
+        span = (sa[0], sb[1]) if sa and sb else (sa or sb)
+        items = [self._snapshot(i) for i in range(len(self.lines))]
+        items[li:li + 2] = [(merged, result, span, None)]
+        self._forget(b)
+        self._restructure(items, li)
+
+    def shift_times(self, lines: list[int] | None, delta: float) -> tuple[int, int]:
+        """Move the timing of the given lines (all when None) by delta ms.
+
+        Line taps, syllable times and manual line times move. Returns (moved,
+        lines without any timing of the tool's own, left where they are).
+        """
+        targets = range(len(self.lines)) if lines is None else sorted(set(lines))
+        times = []
+        for li in targets:
+            sp = self._own_span(li)
+            if sp:
+                times.append(sp[0])
+            times += [v for v in self.layout_overrides.get(li, ()) if v is not None]
+            if li in self.results and not self.layout_on:
+                times.append(self.line_start(li))
+        if times and min(times) + delta < 0:
+            raise ValueError("times would become negative")
+        moved = untouched = 0
+        for li in targets:
+            changed = False
+            if li in self.line_taps:
+                s, e = self.line_taps[li]
+                self.line_taps[li] = (s + delta, e + delta)
+                changed = True
+            r = self.results.get(li)
+            if r:
+                r.bounds = [(s + delta, e + delta) for s, e in r.bounds]
+                line = self.lines[li]
+                if not line.added and not self.layout_on:     # the file's own line times move along
+                    if r.start_override is None:
+                        r.start_override = line.event.start_ms
+                    if r.end_override is None:
+                        r.end_override = line.event.end_ms
+                if r.start_override is not None:
+                    r.start_override = int(round(r.start_override + delta))
+                if r.end_override is not None:
+                    r.end_override = int(round(r.end_override + delta))
+                r.source = FROM_TAPS
+                changed = True
+            ov = self.layout_overrides.get(li)
+            if ov:
+                self.layout_overrides[li] = tuple(None if v is None else int(round(v + delta)) for v in ov)
+                changed = True
+            moved += changed
+            untouched += not changed
+        self.take = self.line_take = None
+        self.drag_history.clear()
+        self.line_drag_history.clear()
+        self.dirty = True
+        return moved, untouched
+
+    # -- dragging line taps on the song timeline ------------------------------------------------
+    def line_draggable(self, li: int) -> bool:
+        """Line taps can be dragged; lines with tapped syllables are edited on their waveform."""
+        return li in self.line_taps and li not in self.results
+
+    def begin_line_drag(self, li: int) -> None:
+        self.line_drag_history.append((li, self.line_taps.get(li)))
+        del self.line_drag_history[:-DRAG_UNDO_LIMIT]
+        self.line_take = None           # its replay log would bring the old times back
+
+    def move_line_edge(self, li: int, edge: str, ms: float) -> float:
+        """Move a line tap's 'start' or 'end' (10 ms steps). Returns where it landed."""
+        s, e = self.line_taps[li]
+        ms = round(ms / 10) * 10
+        if edge == "start":
+            ms = min(max(0.0, ms), e - MIN_LINE_MS)
+            self.line_taps[li] = (ms, e)
+        else:
+            ms = max(ms, s + MIN_LINE_MS)
+            self.line_taps[li] = (s, ms)
+        self.dirty = True
+        return ms
+
+    def undo_line_drag(self) -> int | None:
+        if not self.line_drag_history:
+            return None
+        li, prev = self.line_drag_history.pop()
+        self.line_take = None
+        if prev is None:
+            self.line_taps.pop(li, None)
+        else:
+            self.line_taps[li] = prev
+        self.dirty = True
+        return li
 
     # -- takes -------------------------------------------------------------------
     def start_take(self, li: int) -> None:
@@ -620,45 +878,69 @@ class Controller:
             self.dirty = True
 
     # -- export ------------------------------------------------------------------
-    def export_bytes(self) -> bytes:
-        repl: dict[int, str] = {}
-        placements = self.placements() if self.layout_on else None
-        for li, line in enumerate(self.lines):
-            timing = self.timing_for(li)
-            ev = line.event
-            if placements is not None and placements[li] is not None:
-                # The layout decides every timed line's times and style.
-                if timing:
-                    text = line.kara.rebuild(timing.values, timing.inserts)
-                    start, end = timing.start_cs * 10, timing.end_cs * 10
-                else:           # only the line was tapped: keep the placeholder \k
-                    text = line.kara.text
-                    start, end = to_cs(self.line_start(li)) * 10, to_cs(self.line_end(li)) * 10
-                new_ev = ev.with_fields(text=text, style=placements[li].style,
-                                        start=format_time(start, like=ev.get("start")),
-                                        end=format_time(end, like=ev.get("end")))
-                if new_ev.render() != self.doc.lines[ev.line_no]:
-                    repl[ev.line_no] = new_ev.render()
-                continue
-            if timing is None:
-                if line.edited:       # untapped, but its syllable split was changed
-                    repl[ev.line_no] = ev.with_fields(text=line.kara.text).render()
-                continue
+    def _render(self, li: int, placements: list[Placement | None] | None) -> str | None:
+        """Line li as it goes into the exported file; None when the file's line stays as it is."""
+        line = self.lines[li]
+        ev = line.event
+        timing = self.timing_for(li)
+        original = None if line.added else self.doc.lines[ev.line_no]
+
+        def times(start: float, end: float) -> dict:
+            return {"start": format_time(start, like=ev.get("start")),
+                    "end": format_time(end, like=ev.get("end"))}
+
+        if placements is not None and placements[li] is not None:
+            # The layout decides every timed line's times and style.
+            if timing:
+                text = line.kara.rebuild(timing.values, timing.inserts)
+                start, end = timing.start_cs * 10, timing.end_cs * 10
+            else:           # only the line was tapped: keep the placeholder \k
+                text = line.kara.text
+                start, end = to_cs(self.line_start(li)) * 10, to_cs(self.line_end(li)) * 10
+            new_ev = ev.with_fields(text=text, style=placements[li].style, **times(start, end))
+        elif timing is None:
+            changes = {"text": line.kara.text}
+            span = self._own_span(li) if line.added else None
+            if span:
+                changes.update(times(to_cs(span[0]) * 10, to_cs(span[1]) * 10))
+            if not line.added and not line.edited:
+                return None
+            new_ev = ev.with_fields(**changes)
+        else:
             r = self.results[li]
-            if r.source == FROM_FILE:  # \k from the file, untouched: keep the line as it is
-                continue
+            if r.source == FROM_FILE and not line.added:
+                return None     # \k from the file, untouched: keep the line as it is
             changes = {"text": line.kara.rebuild(timing.values, timing.inserts)}
-            if (self.settings.line_timing == TAPPED or r.start_override is not None
+            if (line.added or self.settings.line_timing == TAPPED or r.start_override is not None
                     or r.end_override is not None):
-                if timing.start_cs * 10 != ev.start_ms:
+                if line.added or timing.start_cs * 10 != ev.start_ms:
                     changes["start"] = format_time(timing.start_cs * 10, like=ev.get("start"))
-                if timing.end_cs * 10 != ev.end_ms:
+                if line.added or timing.end_cs * 10 != ev.end_ms:
                     changes["end"] = format_time(timing.end_cs * 10, like=ev.get("end"))
             new_ev = ev.with_fields(**changes)
-            line_text = new_ev.render()
-            if line_text != self.doc.lines[ev.line_no]:
-                repl[ev.line_no] = line_text
-        return self.doc.to_bytes(repl)
+        text = new_ev.render()
+        return None if text == original else text
+
+    def export_bytes(self) -> bytes:
+        repl: dict[int, str | None] = {int(key): None for key in self.deleted}
+        after: dict[int, list[str]] = {}
+        before: dict[int, list[str]] = {}
+        placements = self.placements() if self.layout_on else None
+        for li, line in enumerate(self.lines):
+            text = self._render(li, placements)
+            if not line.added:
+                if text is not None:
+                    repl[line.event.line_no] = text
+                continue
+            # A new line goes after the file line shown before it (or before the one after it).
+            prev = next((self.lines[k] for k in range(li - 1, -1, -1) if not self.lines[k].added), None)
+            if prev is not None:
+                after.setdefault(prev.event.line_no, []).append(text)
+                continue
+            nxt = next((l for l in self.lines[li + 1:] if not l.added), None)
+            anchor = nxt.event.line_no if nxt else self._first_event.line_no
+            before.setdefault(anchor, []).append(text)
+        return self.doc.to_bytes(repl, after, before)
 
     # -- progress file ---------------------------------------------------------------
     def progress_data(self) -> dict:
@@ -692,6 +974,12 @@ class Controller:
                     for li, (s, e) in sorted(self.layout_overrides.items())
                 },
             },
+            "structure": {
+                "deleted": dict(sorted(self.deleted.items())),
+                "added": [{"key": l.key, "after": self.lines[i - 1].key if i else None, "text": l.event.text}
+                          for i, l in enumerate(self.lines) if l.added],
+                "next": self.next_added,
+            },
         }
 
     def save_progress(self) -> None:
@@ -707,18 +995,22 @@ class Controller:
         if not self.progress_path or not self.progress_path.exists():
             return
         data = json.loads(self.progress_path.read_text(encoding="utf-8"))
-        by_key = {l.key: l for l in self.lines}
-        by_text: dict[str, list[LineInfo]] = {}
-        for l in self.lines:
-            by_text.setdefault(l.event.text, []).append(l)
 
-        def find(key: str, text: str) -> LineInfo | None:
-            line = by_key.get(key)
-            if line is None or line.event.text != text:
-                cands = by_text.get(text, [])
-                line = cands[0] if len(cands) == 1 else None
-            return line
+        def finder():
+            by_key = {l.key: l for l in self.lines}
+            by_text: dict[str, list[LineInfo]] = {}
+            for l in self.lines:
+                by_text.setdefault(l.event.text, []).append(l)
 
+            def find(key: str, text: str) -> LineInfo | None:
+                line = by_key.get(key)
+                if line is None or line.event.text != text:
+                    cands = [c for c in by_text.get(text, []) if not c.added]
+                    line = cands[0] if len(cands) == 1 else None
+                return line
+            return find
+
+        find = finder()
         dropped = 0
         for key, rec in data.get("edits", {}).items():     # syllable splits first: taps depend on them
             line = find(key, rec["text"])
@@ -726,6 +1018,31 @@ class Controller:
                 dropped += 1
                 continue
             self.lines[line.idx] = make_line(line.idx, line.event, rec["edited"])
+        # Lines removed and added in the tool.
+        st = data.get("structure", {})
+        self.next_added = int(st.get("next", 1))
+        gone = set()
+        for key, text in st.get("deleted", {}).items():
+            line = find(key, text)
+            if line is None:
+                dropped += 1
+                continue
+            gone.add(line.idx)
+            self.deleted[line.key] = text
+        self.lines = [l for l in self.lines if l.idx not in gone]
+        for rec in st.get("added", []):
+            pos = 0
+            if rec.get("after") is not None:
+                pos = next((i + 1 for i, l in enumerate(self.lines) if l.key == rec["after"]), len(self.lines))
+            like = self.lines[pos - 1].event if pos else (self.lines[0].event if self.lines else self._first_event)
+            line = make_line(0, self._new_event(like, rec["text"]), rec["text"], rec["key"])
+            if not line.taps:
+                dropped += 1
+                continue
+            self.lines.insert(pos, line)
+        for i, l in enumerate(self.lines):
+            l.idx = i
+        find = finder()
         for key, rec in data.get("lines", {}).items():
             line = find(key, rec["text"])
             line = self.lines[line.idx] if line else None

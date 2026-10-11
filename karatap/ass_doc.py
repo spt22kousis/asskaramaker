@@ -189,10 +189,29 @@ class AssDocument:
                 names.append(line.split(":", 1)[1].split(",", 1)[0].strip())
         return names
 
-    def to_bytes(self, replacements: dict[int, str] | None = None) -> bytes:
-        replacements = replacements or {}
+    def default_eol(self) -> str:
+        eols = [e for e in self.eols if e]
+        return max(set(eols), key=eols.count) if eols else "\r\n"
+
+    def to_bytes(self, replacements: dict[int, str | None] | None = None,
+                 after: dict[int, list[str]] | None = None,
+                 before: dict[int, list[str]] | None = None) -> bytes:
+        """The document with lines replaced (None removes a line) and new lines inserted
+        after / before existing line numbers. Everything else is written back as read."""
+        replacements, after, before = replacements or {}, after or {}, before or {}
+        eol = self.default_eol()
         out = []
-        for no, (line, eol) in enumerate(zip(self.lines, self.eols)):
-            out.append(replacements.get(no, line))
-            out.append(eol)
+        for no, (line, line_eol) in enumerate(zip(self.lines, self.eols)):
+            for new in before.get(no, ()):
+                out += [new, eol]
+            removed = no in replacements and replacements[no] is None
+            if not removed:
+                out += [replacements.get(no, line), line_eol]
+            new_lines = after.get(no)
+            if new_lines:
+                if line_eol:
+                    for new in new_lines:
+                        out += [new, eol]
+                else:                   # the file's last line, without a line break
+                    out += ([] if removed else [eol]) + [eol.join(new_lines)]
         return self.bom + "".join(out).encode(self.encoding, "surrogateescape")

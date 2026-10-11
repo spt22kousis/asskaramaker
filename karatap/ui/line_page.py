@@ -3,11 +3,13 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QFontMetricsF, QPainter
-from PySide6.QtWidgets import QListWidget, QListWidgetItem, QSplitter, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (QAbstractItemView, QListWidget, QListWidgetItem, QSplitter, QVBoxLayout,
+                               QWidget)
 
 from ..ass_doc import format_time
 from ..controller import Controller
 from .helpbar import HelpBar, key
+from .timeline import TimelineView
 from .widgets import ACTIVE, BG, DIM, NEXT, PRESSED_BG, jp_font, ui_font
 
 STATE_ICON = {"todo": "○", "tapped": "●", "syllables": "◆", "active": "◐", "next": "▶"}
@@ -22,7 +24,10 @@ HELP = """這一頁先把每一行「什麼時候開始唱、什麼時候唱完�
 • 起點模式（M 切換）：只看按下的時間，這行到按下一行或結束鍵 {end} 時才結束。
 • 空白：播放／暫停　Backspace：復原上一下　R：從目前這行重打　↑／↓：上一行／下一行　←／→：倒退／前進 2 秒
 • S：切換速度　P：保持音高　Ctrl+L：延遲校正（第一次用建議先做）
-• 清單：○ 還沒打　● 打好了　◆ 已經打好音節（以音節的時間為準）　雙擊某一行＝從那行開始打"""
+• 清單：○ 還沒打　● 打好了　◆ 已經打好音節（以音節的時間為準）　雙擊某一行＝從那行開始打　右鍵＝修改、拆開、合併、插入、刪除行
+• 下方時間軸：滾輪＝左右捲動　Ctrl＋滾輪＝縮放　拖曳空白處＝捲動　點一下＝跳到那裡　雙擊區塊＝從那行開始打
+  暫停時拖曳區塊的左右邊＝調整行軸（Ctrl+Z 復原）；已打好音節的行（◆）請到「② 音節」的波形調整
+• Ctrl+T：時間平移（整首或清單裡選取的行，可以 Shift／Ctrl 多選）"""
 
 
 class LineCue(QWidget):
@@ -79,8 +84,11 @@ class LinePage(QWidget):
         self.list = QListWidget()
         self.list.setFont(ui_font(14))
         self.list.setFocusPolicy(Qt.NoFocus)
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.cue = LineCue()
         self.help = HelpBar()
+        self.timeline = TimelineView()
         split = QSplitter()
         split.addWidget(self.list)
         split.addWidget(self.cue)
@@ -90,6 +98,7 @@ class LinePage(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.help)
         outer.addWidget(split, 1)
+        outer.addWidget(self.timeline)
         self._last: list[tuple] = []
 
     def set_help(self, taps: str, end: str) -> None:

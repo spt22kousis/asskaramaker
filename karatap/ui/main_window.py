@@ -7,9 +7,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QKeySequence
-from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QLabel, QListWidget,
-                               QListWidgetItem, QMainWindow, QMessageBox, QSplitter, QTabWidget,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QInputDialog, QLabel,
+                               QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+                               QSplitter, QTabWidget, QVBoxLayout, QWidget)
 
 from ..ass_doc import AssDocument, format_time
 from ..audio import AudioError, AudioSource, Player, pick_output_device
@@ -17,9 +17,12 @@ from ..clock import SongClock
 from ..controller import (IMPORTED, PARTIAL, TAPPED_OK, UNTAPPED, WARNING, Action, Controller,
                           progress_path_for)
 from ..karaoke import merge_syllables, split_syllable
+from ..lyrics import has_taps, kara_to_editor, make_line, parse_text, to_kara_text
+from ..onsets import detect
+from ..waveform import envelope
 from ..settings import Settings
 from ..timing import HOLD, KEEP, ONSET, TAPPED
-from .dialogs import CalibrationDialog, SettingsDialog
+from .dialogs import CalibrationDialog, SettingsDialog, ShiftDialog
 from .helpbar import HelpBar, key
 from .layout_page import LayoutPage
 from .line_page import LinePage
@@ -40,7 +43,8 @@ HELP = """• 打軸鍵：{taps}（可以多鍵交替、雙押）　結束鍵：
 • M：長按／起點模式　S：切換速度　P：保持音高　C：逐行／連續　T：行時間模式　Ctrl+L：延遲校正（第一次用建議先做）
 • 切音節：暫停時點目前那行字與字之間（紫線＝可以合併的分界，灰線＝不能合併，點＝可以切開的地方）
 • 微調：暫停時拖曳波形上的邊界（Shift＋拖曳＝行頭／行尾）　點波形＝移動播放位置　Ctrl+Z：復原拖曳　V：波形／頻譜
-• E：延長選取行的行時間（敲出界時）　Ctrl+S：存進度　Ctrl+E：匯出新 ASS　Ctrl+,：設定"""
+• E：延長選取行的行時間（敲出界時）　Ctrl+S：存進度　Ctrl+E：匯出新 ASS　Ctrl+,：設定
+• 行清單按右鍵：修改、拆開、合併、插入、刪除行　Ctrl+T：時間平移（整首或選取的行）"""
 
 
 PAGE_LINES, PAGE_SYLLABLES, PAGE_LAYOUT = 0, 1, 2
@@ -56,6 +60,8 @@ class Bridge(QObject):
     audio_loaded = Signal(object, object)       # AudioSource | None, error str | None
     variant_ready = Signal(float, bool)
     playback_finished = Signal()
+    onsets_ready = Signal(object, object)       # AudioSource, onset ms array | None
+    envelope_ready = Signal(object, object)     # AudioSource, waveform envelope
 
 
 class MainWindow(QMainWindow):
@@ -102,6 +108,9 @@ class MainWindow(QMainWindow):
         self.list = QListWidget()
         self.list.setFont(ui_font(14))
         self.list.setFocusPolicy(Qt.NoFocus)
+        self.list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(lambda pos: self._line_menu(self.list, pos))
         self.list.itemDoubleClicked.connect(lambda it: self.jump(self.list.row(it)))
         self.view.edit_requested.connect(self.edit_syllables)
 
@@ -125,6 +134,20 @@ class MainWindow(QMainWindow):
         self.line_page = LinePage()
         self.line_page.list.itemDoubleClicked.connect(
             lambda it: self.jump_line(self.line_page.list.row(it)))
+        self.line_page.list.customContextMenuRequested.connect(
+            lambda pos: self._line_menu(self.line_page.list, pos))
+        tl = self.line_page.timeline
+        tl.seek_requested.connect(self.seek_to)
+        tl.line_clicked.connect(self.line_page.list.setCurrentRow)
+        tl.line_activated.connect(self.jump_line)
+        tl.changed.connect(self._after_line_drag)
+        self.onsets = None
+        self.bridge.onsets_ready.connect(self._on_onsets)
+        self.bridge.envelope_ready.connect(
+            lambda src, env: tl.set_audio(tl.length_ms, env) if src is self.source else None)
+        for v in (self.wave, tl):
+            v.set_snap(settings.snap_onsets)
+        self._synced_line = self._synced_syl = -1
         self.layout_page = LayoutPage()
         self.layout_page.changed.connect(self._after_layout_change)
         self.layout_page.export_requested.connect(self.export)
@@ -185,10 +208,21 @@ class MainWindow(QMainWindow):
         act(m, "延長選取行的行時間 (E)", lambda: self.extend_line(self.list.currentRow()))
         act(m, "清除選取行的打軸結果", self.clear_selected)
         act(m, "還原目前這行的音節切分", self.revert_split)
+        m.addSeparator()
+        act(m, "時間平移…", self.shift_times, "Ctrl+T")
+        m.addSeparator()
+        act(m, "修改這行…", lambda: self.edit_line_text())
+        act(m, "拆成兩行…", lambda: self.split_line())
+        act(m, "和下一行合併", lambda: self.merge_line())
+        act(m, "在後面插入一行…", lambda: self.insert_line())
+        act(m, "刪除這行", lambda: self.delete_line())
         m = self.menuBar().addMenu("工具")
         act(m, "延遲校正…", self.calibrate, "Ctrl+L")
         act(m, "切換波形／頻譜 (V)", self.toggle_wave_mode)
         act(m, "復原上一次拖曳", self.undo_drag, "Ctrl+Z")
+        snap = act(m, "拖曳時吸附到發聲起點（按住 Alt 暫時不吸）", self.toggle_snap)
+        snap.setCheckable(True)
+        snap.setChecked(self.settings.snap_onsets)
         act(m, "設定…", self.open_settings, "Ctrl+,")
         m = self.menuBar().addMenu("說明")
         act(m, "關於 karatap", lambda: QMessageBox.about(self, "關於 karatap", ABOUT))
@@ -245,7 +279,9 @@ class MainWindow(QMainWindow):
         self.view.set_controller(ctrl)
         self.wave.set_controller(ctrl)
         self.line_page.rebuild(ctrl)
+        self.line_page.timeline.set_controller(ctrl)
         self.layout_page.set_controller(ctrl)
+        self._synced_line = self._synced_syl = -1
         if imported:
             self.statusBar().showMessage(f"有 {imported} 行沿用檔案裡原有的 \\k（◆），重敲或拖曳後才會改", 6000)
         self.setWindowTitle(f"karatap — {ass.name}")
@@ -303,9 +339,39 @@ class MainWindow(QMainWindow):
             return
         self.source = src
         self.wave.set_audio(src.base, src.sr)
+        self.line_page.timeline.set_audio(len(src.base) / src.sr * 1000, None)
+        self._start_onsets(src)
         self.apply_variant()
         for sp in self.settings.speeds:     # pre-render the other speeds in the background
             self._queue_render(sp, self.settings.keep_pitch)
+
+    def _start_onsets(self, src) -> None:
+        """Timeline envelope and onsets, computed off the GUI thread."""
+        self._on_onsets(src, None)
+
+        def work():
+            self.bridge.envelope_ready.emit(src, envelope(src.base, src.sr))
+            try:
+                found = detect(src.base, src.sr)
+            except Exception as e:      # snapping is optional: keep working without it
+                print("onset detection failed:", e)
+                found = None
+            self.bridge.onsets_ready.emit(src, found)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_onsets(self, src, onsets) -> None:
+        if src is not self.source:
+            return
+        self.onsets = onsets
+        self.wave.set_onsets(onsets)
+        self.line_page.timeline.set_onsets(onsets)
+
+    def toggle_snap(self, on: bool) -> None:
+        self.settings.snap_onsets = bool(on)
+        self.settings.save()
+        for v in (self.wave, self.line_page.timeline):
+            v.set_snap(self.settings.snap_onsets)
 
     # -- speed variants --------------------------------------------------------------
     def _queue_render(self, speed: float, keep: bool) -> None:
@@ -550,7 +616,10 @@ class MainWindow(QMainWindow):
             if play:
                 self.player.play()
         self.line_page.list.setCurrentRow(li)
+        self._synced_line = li
         self.line_page.refresh(self.ctrl)
+        sp = self.ctrl.sung_span(li)
+        self.line_page.timeline.show_ms(sp[0] if sp else self.ctrl.line_seek_target(li))
 
     def line_undo(self) -> None:
         if not self.ctrl:
@@ -697,12 +766,194 @@ class MainWindow(QMainWindow):
     def undo_drag(self) -> None:
         if not self.ctrl:
             return
+        if self.tabs.currentIndex() == PAGE_LINES:
+            li = self.ctrl.undo_line_drag()
+            if li is None:
+                self.statusBar().showMessage("沒有可以復原的拖曳", 2000)
+                return
+            self.statusBar().showMessage(f"已復原第 {li + 1} 行的拖曳", 2000)
+            self._after_line_drag(li)
+            return
         li = self.ctrl.undo_drag()
         if li is None:
             self.statusBar().showMessage("沒有可以復原的拖曳", 2000)
             return
         self.statusBar().showMessage(f"已復原第 {li + 1} 行的拖曳", 2000)
         self._after_drag(li)
+
+    # -- editing the line list ----------------------------------------------------------------
+    def _page_list(self) -> QListWidget | None:
+        page = self.tabs.currentIndex()
+        return {PAGE_LINES: self.line_page.list, PAGE_SYLLABLES: self.list}.get(page)
+
+    def _target_line(self) -> int:
+        lst = self._page_list()
+        row = lst.currentRow() if lst else self.layout_page.table.currentRow()
+        if row < 0 and self.ctrl:
+            row = self.ctrl.line_current() if self.tabs.currentIndex() == PAGE_LINES else self.ctrl.current_line()
+        return row
+
+    def _selected_lines(self) -> list[int]:
+        lst = self._page_list()
+        view = lst if lst else self.layout_page.table
+        return sorted({i.row() for i in view.selectedIndexes()})
+
+    def _line_menu(self, lst: QListWidget, pos) -> None:
+        row = lst.indexAt(pos).row()
+        if not self.ctrl or row < 0:
+            return
+        if row not in {i.row() for i in lst.selectedIndexes()}:
+            lst.setCurrentRow(row)
+        menu = QMenu(self)
+        for text, slot in (("修改這行…", self.edit_line_text), ("拆成兩行…", self.split_line),
+                           ("和下一行合併", self.merge_line), ("在後面插入一行…", self.insert_line),
+                           ("刪除這行", self.delete_line)):
+            menu.addAction(text).triggered.connect(lambda _=False, s=slot: s(row))
+        menu.addSeparator()
+        menu.addAction("時間平移…").triggered.connect(lambda _=False: self.shift_times())
+        menu.exec(lst.mapToGlobal(pos))
+
+    def _ask_lyrics(self, title: str, label: str, text: str) -> list[str] | None:
+        """Lyrics typed in the editor syntax -> karaoke texts, one per line."""
+        new, ok = QInputDialog.getMultiLineText(self, title, label, text)
+        if not ok or new == text:
+            return None
+        texts = [to_kara_text(line) for line in (make_line(segs) for segs in parse_text(new)) if has_taps(line)]
+        if not texts:
+            QMessageBox.warning(self, title, "沒有可以打軸的文字。")
+            return None
+        return texts
+
+    def _before_structure(self) -> bool:
+        if not self.ctrl:
+            return False
+        if self.player:
+            self.player.pause()
+        self.held.clear()
+        return True
+
+    def _after_structure(self, li: int) -> None:
+        c = self.ctrl
+        self._synced_line = self._synced_syl = -1
+        self.line_page.rebuild(c)
+        self._rebuild_list()
+        self.layout_page.refresh()
+        self.wave.set_controller(c)
+        self.view.update()
+        self.line_page.timeline.update()
+        li = max(0, min(li, len(c.lines) - 1))
+        if self.tabs.currentIndex() == PAGE_LINES:
+            self.jump_line(li)
+        else:
+            self.jump(li)
+        self._autosave(force=True)
+
+    def edit_line_text(self, li: int | None = None) -> None:
+        if not self._before_structure():
+            return
+        li = self._target_line() if li is None else li
+        c = self.ctrl
+        kara = c.lines[li].kara
+        texts = self._ask_lyrics(f"修改第 {li + 1} 行",
+                                 "[漢字|かな] 是振假名；換行會在後面多出新的行。\n這行的音節打軸會清掉，行軸保留。",
+                                 kara_to_editor(kara.text))
+        if texts is None:
+            return
+        # Tag-only blocks right before the first syllable (e.g. {\-A}) stay; others can't be placed.
+        lead_end = kara.blocks[kara.syls[0].block].start
+        lead = kara.text[kara.insert_pos(0):lead_end]
+        lost = [b for b in kara.blocks if not b.has_k and b.start >= lead_end]
+        warn = []
+        if li in c.results:
+            warn.append("這行已經打好音節，改歌詞會清掉音節的打軸結果。")
+        if lost:
+            warn.append(f"這行中間有 {len(lost)} 個特效標記（例如 {{\\-A}}），修改後會被移除。")
+        if warn and QMessageBox.question(self, "修改歌詞", "\n".join(warn) + "\n要繼續嗎？") != QMessageBox.Yes:
+            return
+        texts[0] = lead + texts[0]
+        c.replace_text(li, texts)
+        self._after_structure(li)
+
+    def insert_line(self, li: int | None = None) -> None:
+        if not self._before_structure():
+            return
+        li = self._target_line() if li is None else li
+        texts = self._ask_lyrics("在後面插入一行", f"插在第 {li + 1} 行後面。[漢字|かな] 是振假名；換行＝多插幾行。", "")
+        if texts is None:
+            return
+        at = li
+        for text in texts:
+            at = self.ctrl.insert_line(at, text)
+        self._after_structure(li + 1)
+
+    def delete_line(self, li: int | None = None) -> None:
+        if not self._before_structure():
+            return
+        li = self._target_line() if li is None else li
+        c = self.ctrl
+        if len(c.lines) <= 1:
+            QMessageBox.warning(self, "刪除這行", "至少要留一行。")
+            return
+        timed = li in c.results or li in c.line_taps
+        msg = f"刪除第 {li + 1} 行「{c.lines[li].plain}」？" + ("\n這行的打軸結果也會一起刪掉。" if timed else "")
+        if QMessageBox.question(self, "刪除這行", msg) != QMessageBox.Yes:
+            return
+        c.delete_line(li)
+        self._after_structure(li)
+
+    def split_line(self, li: int | None = None) -> None:
+        if not self._before_structure():
+            return
+        li = self._target_line() if li is None else li
+        options = self.ctrl.split_options(li)
+        if not options:
+            QMessageBox.information(self, "拆成兩行", "這行太短，沒有可以拆開的地方。")
+            return
+        labels = [label for _, label in options]
+        item, ok = QInputDialog.getItem(self, "拆成兩行", "從哪裡拆開？已打好的音節時間會跟著分到兩行。",
+                                        labels, len(labels) // 2, False)
+        if not ok:
+            return
+        self.ctrl.split_line(li, options[labels.index(item)][0])
+        self._after_structure(li)
+
+    def merge_line(self, li: int | None = None) -> None:
+        if not self._before_structure():
+            return
+        li = self._target_line() if li is None else li
+        if li + 1 >= len(self.ctrl.lines):
+            QMessageBox.information(self, "和下一行合併", "這是最後一行。")
+            return
+        if self.ctrl.merge_loses_syllables(li) and QMessageBox.question(
+                self, "和下一行合併",
+                "只有其中一行打好了音節，合併後音節的打軸結果會清掉（行軸保留）。要繼續嗎？") != QMessageBox.Yes:
+            return
+        self.ctrl.merge_with_next(li)
+        self._after_structure(li)
+
+    def shift_times(self) -> None:
+        if not self._before_structure():
+            return
+        selected = self._selected_lines()
+        dlg = ShiftDialog(len(selected), self)
+        if not dlg.exec() or dlg.delta == 0:
+            return
+        try:
+            moved, untouched = self.ctrl.shift_times(selected if dlg.only_selected else None, dlg.delta)
+        except ValueError:
+            QMessageBox.warning(self, "時間平移", "平移後會有時間變成負的，請改小一點。")
+            return
+        msg = f"已平移 {moved} 行（{dlg.delta:+d} ms）。"
+        if untouched:
+            msg += f"\n{untouched} 行還沒有打軸資料，沒有移動。"
+        msg += f"\n要復原就再平移一次 {-dlg.delta:+d} ms。"
+        QMessageBox.information(self, "時間平移", msg)
+        self._after_structure(self._target_line())
+
+    def _after_line_drag(self, li: int) -> None:
+        self.line_page.refresh(self.ctrl)
+        self._last_statuses = []
+        self._autosave(force=True)
 
     def toggle_wave_mode(self) -> None:
         self.settings.wave_mode = "spec" if self.settings.wave_mode == "wave" else "wave"
@@ -838,9 +1089,11 @@ class MainWindow(QMainWindow):
         nxt = c.lines[cur].plain if not done_all else ""
         after = [c.lines[k].plain for k in range(cur + 1, min(cur + 3, len(c.lines)))] if not done_all else []
         self.line_page.cue.set_state(held, nxt, after, pressed, msg)
-        lst = self.line_page.list
-        if lst.currentRow() != cur and not lst.underMouse():
-            lst.setCurrentRow(cur)
+        if cur != self._synced_line:
+            self.line_page.list.setCurrentRow(cur)
+            self._synced_line = cur
+        song = self.clock.song_ms_at(now) if self.player else 0.0
+        self.line_page.timeline.set_state(song, playing, not playing, cur)
         self._frame += 1
         if self._frame % 10 == 0:
             self.line_page.refresh(c)
@@ -893,8 +1146,9 @@ class MainWindow(QMainWindow):
         self.view.set_time(song)
         self.wave.set_state(song, editable=not playing)
         cur = c.current_line()
-        if self.list.currentRow() != cur and not self.list.underMouse():
+        if cur != self._synced_syl:
             self.list.setCurrentRow(cur)
+            self._synced_syl = cur
         self._frame += 1
         if self._frame % 10 == 0:       # statuses only change on taps; this catches partial lines
             self._refresh_list()

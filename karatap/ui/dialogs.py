@@ -8,7 +8,7 @@ import time
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QSpinBox, QVBoxLayout)
+                               QRadioButton, QSpinBox, QVBoxLayout)
 
 from ..audio import Player, make_metronome
 from ..settings import Settings
@@ -88,6 +88,44 @@ class CalibrationDialog(QDialog):
             self.apply_btn.setEnabled(n >= 8)
         else:
             self.stats.setText(f"暖身中… {len(self.errs)}")
+
+
+class ShiftDialog(QDialog):
+    """How far to move the times, and of which lines."""
+
+    def __init__(self, n_selected: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("時間平移")
+        self.ms = QSpinBox()
+        self.ms.setRange(-600000, 600000)
+        self.ms.setSingleStep(10)
+        self.ms.setSuffix(" ms")
+        self.all = QRadioButton("整首")
+        self.selected = QRadioButton(f"清單裡選取的 {n_selected} 行")
+        self.selected.setEnabled(n_selected > 0)
+        (self.selected if n_selected > 1 else self.all).setChecked(True)
+        hint = QLabel("正數＝往後（變晚），負數＝往前（變早）。行軸、音節時間和手動設定的出現／消失時間會一起移動。")
+        hint.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form = QFormLayout()
+        form.addRow("平移", self.ms)
+        form.addRow("範圍", self.all)
+        form.addRow("", self.selected)
+        lay = QVBoxLayout(self)
+        lay.addWidget(hint)
+        lay.addLayout(form)
+        lay.addWidget(buttons)
+        self.resize(420, 180)
+
+    @property
+    def delta(self) -> int:
+        return self.ms.value()
+
+    @property
+    def only_selected(self) -> bool:
+        return self.selected.isChecked()
 
 
 class SettingsDialog(QDialog):

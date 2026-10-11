@@ -7,10 +7,12 @@ from PySide6.QtGui import QColor, QFontMetricsF, QImage, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from ..controller import Controller, Handle
+from ..onsets import snap
 from ..waveform import colormap, peaks, spectrogram
 from .widgets import ACTIVE, BG, DIM, DONE, FG, WARN, ui_font
 
 GRAB_PX = 7          # how close the mouse must be to a boundary to grab it
+SNAP_PX = 8          # a dragged boundary snaps to an onset this close
 LINE_EDGE = QColor("#e8e8ea")
 GAP_SHADE = QColor(0, 0, 0, 110)
 SPAN_FILL = QColor(79, 163, 255, 38)
@@ -33,6 +35,8 @@ class WaveView(QWidget):
         self._range: tuple[float, float] | None = None
         self._drag: tuple[int, Handle] | None = None
         self._frozen: tuple[float, float] | None = None
+        self.onsets: np.ndarray | None = None
+        self.snap_on = False
         self.setMinimumHeight(100)
         self.setMouseTracking(True)
 
@@ -50,6 +54,14 @@ class WaveView(QWidget):
     def set_mode(self, mode: str) -> None:
         self.mode = mode
         self._cache_key = None
+        self.update()
+
+    def set_onsets(self, onsets: np.ndarray | None) -> None:
+        self.onsets = onsets
+        self.update()
+
+    def set_snap(self, on: bool) -> None:
+        self.snap_on = on
         self.update()
 
     def set_state(self, song_ms: float, editable: bool) -> None:
@@ -195,6 +207,15 @@ class WaveView(QWidget):
             p.setPen(QPen(ACTIVE, 3))
             p.drawLine(QPointF(hx, 0), QPointF(hx, h))
 
+        # Onsets a dragged boundary snaps to.
+        if self.snap_on and self.onsets is not None:
+            p.setPen(QPen(QColor("#8a8f99"), 1))
+            t0, t1 = self._range
+            a, b = np.searchsorted(self.onsets, [t0, t1])
+            for t in self.onsets[a:b]:
+                x = self._x(t)
+                p.drawLine(QPointF(x, h - 7), QPointF(x, h))
+
         # Playhead.
         px = self._x(self.song_ms)
         p.setPen(QPen(QColor("#ff4d6d"), 2))
@@ -232,7 +253,11 @@ class WaveView(QWidget):
         x = ev.position().x()
         if self._drag:
             li, h = self._drag
-            h.ms = self.ctrl.move_handle(li, h, self._ms(x))
+            ms = self._ms(x)
+            if self.snap_on and not (ev.modifiers() & Qt.AltModifier):
+                t0, t1 = self._range
+                ms = snap(ms, self.onsets, SNAP_PX * (t1 - t0) / max(1, self.width()))
+            h.ms = self.ctrl.move_handle(li, h, ms)
             self.update()
             return
         near = self.editable and self._nearest_handle(x, bool(ev.modifiers() & Qt.ShiftModifier))

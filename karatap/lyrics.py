@@ -397,5 +397,11 @@ def to_editor_text(line: LyricLine) -> str:
     return "".join(parts)
 
 
+def kara_to_editor(text: str) -> str:
+    """A karaoke line's text in the editor syntax ([漢字|かな])."""
+    segs = parse_text(text)
+    return to_editor_text(make_line(segs[0])) if segs else ""
+
+
 def plain_text(line: LyricLine) -> str:
     return "".join(it if isinstance(it, str) else it.base for it in line.items)
