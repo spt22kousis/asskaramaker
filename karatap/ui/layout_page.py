@@ -23,21 +23,27 @@ class LayoutPage(QWidget):
         super().__init__(parent)
         self.ctrl: Controller | None = None
         self._loading = False
-        self.on = QCheckBox("套用奇偶版面（輸出時依下面的規則決定每行的出現／消失時間和樣式）")
-        self.odd, self.even, self.single = QComboBox(), QComboBox(), QComboBox()
+        self.on = QCheckBox("套用版面（輸出時依下面的規則決定每行的出現／消失時間和樣式）")
+        self.rows = QComboBox()
+        self.rows.addItem("雙行（奇偶兩排交替）", 2)
+        self.rows.addItem("單行（一次一行）", 1)
+        self.odd, self.even, self.single, self.one = QComboBox(), QComboBox(), QComboBox(), QComboBox()
         self.gap = self._seconds(0, 30, "間隔超過這麼久就分成新的一段")
         self.lead = self._seconds(0, 10, "每段第一、二行比開唱早多久出現")
         self.slot = self._seconds(0, 5, "同一排的上一行消失後，隔多久出現下一行")
         self.tail = self._seconds(0, 5, "唱完後多留多久才消失")
         form = QFormLayout()
+        self.form = form
+        form.addRow("排數", self.rows)
         form.addRow("奇數行樣式", self.odd)
         form.addRow("偶數行樣式", self.even)
         form.addRow("整段只有一行時的樣式", self.single)
+        form.addRow("單行樣式", self.one)
         form.addRow("分段間隔", self.gap)
         form.addRow("段首提前出現", self.lead)
         form.addRow("同排接續間隔", self.slot)
         form.addRow("唱完後停留", self.tail)
-        for w in (self.odd, self.even, self.single):
+        for w in (self.rows, self.odd, self.even, self.single, self.one):
             w.currentIndexChanged.connect(self._apply)
         for w in (self.gap, self.lead, self.slot, self.tail):
             w.valueChanged.connect(self._apply)
@@ -94,7 +100,9 @@ class LayoutPage(QWidget):
         self._loading = True
         styles = ctrl.doc.style_names()
         p = ctrl.layout_params
-        for combo, value in ((self.odd, p.odd_style), (self.even, p.even_style), (self.single, p.single_style)):
+        self.rows.setCurrentIndex(self.rows.findData(p.rows) if self.rows.findData(p.rows) >= 0 else 0)
+        for combo, value in ((self.odd, p.odd_style), (self.even, p.even_style), (self.single, p.single_style),
+                             (self.one, p.one_style)):
             combo.clear()
             combo.addItems(styles if value in styles else styles + [value])
             combo.setCurrentText(value)
@@ -110,9 +118,11 @@ class LayoutPage(QWidget):
         if self._loading or not self.ctrl:
             return
         c, p = self.ctrl, self.ctrl.layout_params
+        c.checkpoint("版面設定", merge="layout")
         c.layout_on = self.on.isChecked()
+        p.rows = self.rows.currentData()
         p.odd_style, p.even_style = self.odd.currentText(), self.even.currentText()
-        p.single_style = self.single.currentText()
+        p.single_style, p.one_style = self.single.currentText(), self.one.currentText()
         p.segment_gap_ms = round(self.gap.value() * 1000)
         p.lead_ms = round(self.lead.value() * 1000)
         p.slot_gap_ms = round(self.slot.value() * 1000)
@@ -125,8 +135,15 @@ class LayoutPage(QWidget):
         c = self.ctrl
         if not c:
             return
-        for w in (self.odd, self.even, self.single, self.gap, self.lead, self.slot, self.tail):
+        two = c.layout_params.rows == 2
+        for w in (self.rows, self.odd, self.even, self.single, self.one, self.gap, self.lead, self.slot,
+                  self.tail):
             w.setEnabled(c.layout_on)
+        for w in (self.odd, self.even, self.single, self.gap):
+            self.form.setRowVisible(w, two)
+        self.form.setRowVisible(self.one, not two)
+        self.form.labelForField(self.lead).setText("段首提前出現" if two else "提前出現")
+        self.form.labelForField(self.slot).setText("同排接續間隔" if two else "上一行消失後隔多久出現")
         pl = c.placements() if c.layout_on else [None] * len(c.lines)
         self.table.setRowCount(len(c.lines))
         late = untimed = 0
@@ -190,6 +207,7 @@ class LayoutPage(QWidget):
         if end <= start:
             QMessageBox.warning(self, "手動時間", "消失時間要晚於出現時間。")
             return
+        c.checkpoint("手動時間")
         c.set_layout_override(row, s, e)
         self.refresh()
         self.changed.emit()
@@ -199,6 +217,7 @@ class LayoutPage(QWidget):
         rows = {i.row() for i in self.table.selectedIndexes()}
         if not c or not rows:
             return
+        c.checkpoint("清除手動時間")
         for r in rows:
             c.set_layout_override(r, None, None)
         self.refresh()

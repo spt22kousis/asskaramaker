@@ -222,7 +222,7 @@ def test_drag_handles_shared_and_separate():
     assert c.status(0) == TAPPED_OK                               # no longer the file's timing
     out = AssDocument(c.export_bytes()).karaoke_events()[0].text
     assert out == "{\\k80}あ{\\k0}い{\\k20} {\\k100}う"
-    assert c.undo_drag() == 0
+    assert c.undo_edit() == "拖曳邊界"
     assert c.status(0) == IMPORTED and c.export_bytes() == doc.raw
 
 

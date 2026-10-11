@@ -6,9 +6,10 @@ import statistics
 import time
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-                               QRadioButton, QSpinBox, QVBoxLayout)
+                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QPushButton, QRadioButton, QSpinBox, QVBoxLayout)
 
 from ..audio import Player, make_metronome
 from ..settings import Settings
@@ -128,6 +129,59 @@ class ShiftDialog(QDialog):
         return self.selected.isChecked()
 
 
+LEVEL_ICON = {"error": "⛔", "warn": "⚠", "info": "・"}
+LEVEL_COLOR = {"error": "#ff5c5c", "warn": "#ffcc33", "info": "#9aa0aa"}
+
+
+class CheckDialog(QDialog):
+    """The pre-export check's findings; double-click one to go fix it."""
+
+    def __init__(self, issues: list, lines: list, for_export: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("匯出前檢查" if for_export else "檢查問題")
+        self.issues = issues
+        self.jump_to = None
+        self.export_anyway = False
+        counts = {lvl: sum(i.level == lvl for i in issues) for lvl in LEVEL_ICON}
+        head = QLabel(f"錯誤 {counts['error']}　警告 {counts['warn']}　提示 {counts['info']}"
+                      + ("　｜　雙擊一項跳過去修正" if issues else "　｜　沒有發現問題"))
+        self.list = QListWidget()
+        self.list.setFont(ui_font(14))
+        for issue in issues:
+            words = lines[issue.line].plain
+            it = QListWidgetItem(f"{LEVEL_ICON[issue.level]} 第 {issue.line + 1} 行　{issue.text}　—　{words}")
+            it.setForeground(QColor(LEVEL_COLOR[issue.level]))
+            self.list.addItem(it)
+        self.list.itemDoubleClicked.connect(lambda _: self._jump())
+        jump = QPushButton("跳到這裡")
+        jump.clicked.connect(self._jump)
+        row = QHBoxLayout()
+        row.addWidget(jump)
+        row.addStretch(1)
+        if for_export:
+            go = QPushButton("仍然匯出")
+            go.clicked.connect(self._export)
+            row.addWidget(go)
+        close = QPushButton("取消" if for_export else "關閉")
+        close.clicked.connect(self.reject)
+        row.addWidget(close)
+        lay = QVBoxLayout(self)
+        lay.addWidget(head)
+        lay.addWidget(self.list, 1)
+        lay.addLayout(row)
+        self.resize(760, 460)
+
+    def _jump(self) -> None:
+        row = self.list.currentRow()
+        if row >= 0:
+            self.jump_to = self.issues[row]
+            self.accept()
+
+    def _export(self) -> None:
+        self.export_anyway = True
+        self.accept()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -188,9 +242,9 @@ class SettingsDialog(QDialog):
             return
         keys = "".join(dict.fromkeys(self.tap_keys.text().upper().replace(" ", "")))
         end_key = self.end_key.text().upper()
-        reserved = set("RMSPCTEV")
+        reserved = set("RMSPCTEVWN")
         if not keys or reserved & set(keys + end_key) or end_key in keys:
-            self.error.setText("打軸鍵不能空白，不能和結束鍵重複，也不能用 R M S P C T E V（已是快捷鍵）")
+            self.error.setText("打軸鍵不能空白，不能和結束鍵重複，也不能用 R M S P C T E V W N（已是快捷鍵）")
             return
         s = self.settings
         s.latency_ms = self.latency.value()

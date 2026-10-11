@@ -99,7 +99,7 @@ def test_override_and_drag_handles(tmp_path):
     c.move_handle(0, l0, 10200)           # back to the rule's value: no override
     assert 0 not in c.layout_overrides
     c.move_handle(0, l0, 9600)
-    c.undo_drag()
+    c.undo_edit()
     assert 0 not in c.layout_overrides
 
 

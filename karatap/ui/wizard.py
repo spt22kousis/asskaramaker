@@ -404,7 +404,7 @@ class NewProjectDialog(QDialog):
             p = ctrl.layout_params
             p.odd_style = pick_style(styles, ("Odd",))
             p.even_style = pick_style(styles, ("Even", p.odd_style))
-            p.single_style = pick_style(styles, ("Default", p.odd_style))
+            p.single_style = p.one_style = pick_style(styles, ("Default", p.odd_style))
             ctrl.layout_on = True
             ctrl.save_progress()
         except OSError as e:

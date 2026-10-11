@@ -151,7 +151,7 @@ def test_line_edge_drag_and_undo(tmp_path):
     assert c.move_line_edge(0, "start", 11950) == 11900       # keeps 100 ms
     assert c.move_line_edge(0, "end", 13004) == 13000
     assert c.line_taps[0] == (11900, 13000)
-    assert c.undo_line_drag() == 0 and c.line_taps[0] == (10000, 12000)
+    assert c.undo_edit() == "拖曳行軸" and c.line_taps[0] == (10000, 12000)
     tap_syllables(c, 0, 10000)
     assert not c.line_draggable(0)
 
@@ -192,11 +192,11 @@ def test_display_spans_apply_overrides(tmp_path):
     assert spans[0][:2] == (9000, 12000) and spans[1][:2] == (9500, 14000) and spans[2] is None
 
 
-def test_undo_line_drag_drops_the_take(tmp_path):
+def test_undo_of_a_line_drag_drops_the_take(tmp_path):
     doc, c = project(tmp_path)
     tap_line(c, 0, 10000, 12000)
     c.begin_line_drag(0)
     c.move_line_edge(0, "end", 12500)
     c.start_line_take(0)
-    c.undo_line_drag()
+    c.undo_edit()
     assert c.line_take is None and c.line_taps[0] == (10000, 12000)

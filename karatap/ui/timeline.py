@@ -97,7 +97,9 @@ class TimelineView(QWidget):
         return self.t0 + x / max(1, self.width()) * self.span
 
     def _lanes_h(self) -> int:
-        return 2 * LANE_H + 4 if self.ctrl and self.ctrl.layout_on else 0
+        if not self.ctrl or not self.ctrl.layout_on:
+            return 0
+        return (LANE_H + 2) * self.ctrl.layout_params.rows + 2
 
     def _main(self) -> QRectF:
         top = self._lanes_h()
@@ -166,8 +168,8 @@ class TimelineView(QWidget):
                 s, e, pl = span
                 if e < lo or s > hi:
                     continue
-                even = pl.style == prm.even_style and prm.even_style != prm.odd_style
-                col = EVEN if even else (ODD if pl.style == prm.odd_style else SINGLE)
+                even = prm.rows == 2 and pl.style == prm.even_style and prm.even_style != prm.odd_style
+                col = EVEN if even else (ODD if prm.rows == 2 and pl.style == prm.odd_style else SINGLE)
                 r = QRectF(self._x(s), 2 + (LANE_H + 2) * even, self._x(e) - self._x(s), LANE_H)
                 p.setPen(QPen(LATE, 1.5) if pl.late else Qt.NoPen)
                 p.setBrush(QColor(col.red(), col.green(), col.blue(), 150))

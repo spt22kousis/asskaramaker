@@ -86,7 +86,7 @@ class WaveView(QWidget):
         t = c.take
         if t and li in t.first_target:
             m = t.machine
-            return [(m.start[i], m.end[i]) for i in t.line_targets(li)]
+            return list(t.prefix.get(li, [])) + [(m.start[i], m.end[i]) for i in t.line_targets(li)]
         return []
 
     def _time_range(self, li: int) -> tuple[float, float]:
@@ -184,6 +184,9 @@ class WaveView(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(SPAN_FILL)
             p.drawRect(QRectF(xs, 0, max(1.0, xe - xs), h))
+            if si in c.marked(li):                        # marked during review
+                p.setBrush(WARN)
+                p.drawRect(QRectF(xs, 0, max(1.0, xe - xs), 4))
             text = f.ruby or f.base          # what is sung; the kanji are in the line view above
             p.setPen(FG)
             p.drawText(QRectF(xs + 3, 2, max(0.0, xe - xs - 4), fm.height()),

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
@@ -226,6 +226,7 @@ class LineView(QWidget):
     """
 
     edit_requested = Signal(int, str, int, int)     # line, 'split'/'merge', syllable, piece
+    syllable_menu = Signal(int, int, QPoint)         # right-click: line, syllable, global position
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -234,11 +235,19 @@ class LineView(QWidget):
         self.edit_enabled = False
         self._spots: list[EditSpot] = []
         self._spot_line = -1
+        self._syl_rects: list[tuple[QRectF, int]] = []     # main line: where each syllable is drawn
         self._ruby_bottom = 0.0
         self._hit = 0.0
         self.setMinimumHeight(170)
 
     def mousePressEvent(self, ev) -> None:
+        if ev.button() == Qt.RightButton:
+            pos = ev.position()
+            hits = [(r, si) for r, si in self._syl_rects if r.adjusted(-2, -2, 2, 2).contains(pos)]
+            if hits:
+                si = min(hits, key=lambda h: h[0].width() * h[0].height())[1]
+                self.syllable_menu.emit(self._spot_line, si, ev.globalPosition().toPoint())
+            return
         if not self.edit_enabled or not self._spots or ev.button() != Qt.LeftButton:
             return
         pos = ev.position()
@@ -310,6 +319,8 @@ class LineView(QWidget):
             return FG if main else DIM
 
         spots: list[EditSpot] = []
+        syl_rects: list[tuple[QRectF, int]] = []
+        marked = c.marked(li)
         kara = line.kara
         for n, (u, (w, base_x, ruby_x)) in enumerate(zip(units, layouts)):
             bw = bm.horizontalAdvance(u.base)
@@ -318,6 +329,12 @@ class LineView(QWidget):
             p.setPen(col)
             rect = QRectF(x + base_x, baseline - bm.ascent(), bw, bm.height())
             p.drawText(rect, Qt.AlignCenter, u.base)
+            if u.base_syls:
+                syl_rects.append((rect, u.base_syls[0]))
+            if marked & set(u.base_syls + [si for _, si in u.ruby]):
+                p.setPen(QPen(WARN, max(2.0, size * 0.05)))
+                y = rect.bottom() + 1
+                p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
             if main and any(states.get(s) == "next" for s in u.base_syls[:1]):
                 p.setPen(QPen(NEXT, 2))
                 y = rect.bottom() - 2
@@ -328,7 +345,9 @@ class LineView(QWidget):
                 for j, (text, si) in enumerate(u.ruby):
                     tw = rm.horizontalAdvance(text)
                     p.setPen(colour([si]))
-                    p.drawText(QRectF(rx, rect.top() - rm.height(), tw, rm.height()), Qt.AlignCenter, text)
+                    ruby_rect = QRectF(rx, rect.top() - rm.height(), tw, rm.height())
+                    p.drawText(ruby_rect, Qt.AlignCenter, text)
+                    syl_rects.append((ruby_rect, si))
                     if main:
                         if j:
                             spots.append(self._boundary(kara, u.ruby[j - 1][1], rx, "ruby"))
@@ -344,6 +363,7 @@ class LineView(QWidget):
 
         if main:
             self._spots, self._spot_line = spots, li
+            self._syl_rects = syl_rects
             self._ruby_bottom = baseline - bm.ascent()
             self._hit = size * 0.45
             if self.edit_enabled:

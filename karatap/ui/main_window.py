@@ -22,7 +22,7 @@ from ..onsets import detect
 from ..waveform import envelope
 from ..settings import Settings
 from ..timing import HOLD, KEEP, ONSET, TAPPED
-from .dialogs import CalibrationDialog, SettingsDialog, ShiftDialog
+from .dialogs import CalibrationDialog, CheckDialog, SettingsDialog, ShiftDialog
 from .helpbar import HelpBar, key
 from .layout_page import LayoutPage
 from .line_page import LinePage
@@ -37,13 +37,17 @@ STATUS_COLOR = {UNTAPPED: "#9aa0aa", TAPPED_OK: "#4fa3ff", WARNING: "#ff5c5c", P
 HINT = ("{space} 播放　跟著歌，每個音節按住 {taps} 其中一鍵：按下＝開始唱，放開＝結束　"
         "{bs} 復原　{r} 重打這行　{ud} 換行")
 NO_LINE_TIMING = "<span style='color:#ffcc33'>　⚠ 這行還沒打行軸，建議先到「① 行軸」</span>"
+REVIEW_HINT = ("<span style='color:#ffcc33'>回放檢查中</span>　{space} 播放　看到不對就按 {taps} 標記那個音節　"
+               "{bs} 取消上一個標記　{n} 跳到下一個標記重打　{w} 結束回放")
 
 HELP = """• 打軸鍵：{taps}（可以多鍵交替、雙押）　結束鍵：{end}　畫面上方大字＝下一個要按的音節
 • 空白：播放／暫停　←／→：倒退／前進 2 秒　R：重打這行　Backspace：復原上一下　↑／↓：上一行／下一行　Ctrl+G：跳到第幾行
 • M：長按／起點模式　S：切換速度　P：保持音高　C：逐行／連續　T：行時間模式　Ctrl+L：延遲校正（第一次用建議先做）
 • 切音節：暫停時點目前那行字與字之間（紫線＝可以合併的分界，灰線＝不能合併，點＝可以切開的地方）
-• 微調：暫停時拖曳波形上的邊界（Shift＋拖曳＝行頭／行尾）　點波形＝移動播放位置　Ctrl+Z：復原拖曳　V：波形／頻譜
-• E：延長選取行的行時間（敲出界時）　Ctrl+S：存進度　Ctrl+E：匯出新 ASS　Ctrl+,：設定
+• 微調：暫停時拖曳波形上的邊界（Shift＋拖曳＝行頭／行尾）　點波形＝移動播放位置　V：波形／頻譜
+• 在字上按右鍵：從這個音節開始重打（前面的保留）、標記這個音節
+• W：回放檢查（照打好的時間播放，看到不對就按打軸鍵標記）　N：跳到下一個標記，從那裡重打
+• Ctrl+Z／Ctrl+Y：復原／重做任何修改　E：延長選取行的行時間（敲出界時）　Ctrl+S：存進度　Ctrl+E：檢查並匯出　Ctrl+,：設定
 • 行清單按右鍵：修改、拆開、合併、插入、刪除行　Ctrl+T：時間平移（整首或選取的行）"""
 
 
@@ -113,6 +117,9 @@ class MainWindow(QMainWindow):
         self.list.customContextMenuRequested.connect(lambda pos: self._line_menu(self.list, pos))
         self.list.itemDoubleClicked.connect(lambda it: self.jump(self.list.row(it)))
         self.view.edit_requested.connect(self.edit_syllables)
+        self.view.syllable_menu.connect(self._syllable_menu)
+        self.review = False
+        self._last_mark: tuple[int, int] | None = None
 
         right = QWidget()
         lay = QVBoxLayout(right)
@@ -202,12 +209,23 @@ class MainWindow(QMainWindow):
         act(m, "存進度", self.save_progress, "Ctrl+S")
         act(m, "匯出新 ASS…", self.export, "Ctrl+E")
         m.addSeparator()
+        act(m, "從備份還原…", self.restore_backup)
+        m.addSeparator()
         act(m, "離開", self.close)
+        m = self.menuBar().addMenu("編輯")
+        self.undo_action = act(m, "復原", self.undo_edit, "Ctrl+Z")
+        self.redo_action = act(m, "重做", self.redo_edit, "Ctrl+Y")
+        self.redo_action.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
+        m.aboutToShow.connect(self._update_edit_menu)
         m = self.menuBar().addMenu("打軸")
         act(m, "跳到第幾行…", self.ask_jump, "Ctrl+G")
         act(m, "延長選取行的行時間 (E)", lambda: self.extend_line(self.list.currentRow()))
         act(m, "清除選取行的打軸結果", self.clear_selected)
         act(m, "還原目前這行的音節切分", self.revert_split)
+        m.addSeparator()
+        act(m, "回放檢查開／關 (W)", self.toggle_review)
+        act(m, "跳到下一個標記重打 (N)", self.goto_next_mark)
+        act(m, "清除所有標記", self.clear_marks)
         m.addSeparator()
         act(m, "時間平移…", self.shift_times, "Ctrl+T")
         m.addSeparator()
@@ -219,7 +237,7 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu("工具")
         act(m, "延遲校正…", self.calibrate, "Ctrl+L")
         act(m, "切換波形／頻譜 (V)", self.toggle_wave_mode)
-        act(m, "復原上一次拖曳", self.undo_drag, "Ctrl+Z")
+        act(m, "檢查問題…", self.show_check, "Ctrl+Shift+C")
         snap = act(m, "拖曳時吸附到發聲起點（按住 Alt 暫時不吸）", self.toggle_snap)
         snap.setCheckable(True)
         snap.setChecked(self.settings.snap_onsets)
@@ -274,6 +292,12 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError) as e:
             QMessageBox.warning(self, "進度檔", f"讀取進度失敗，從頭開始：{e}")
         imported = ctrl.import_file_timing()
+        try:
+            ctrl.backup_now()           # the progress as found, before this session changes it
+        except OSError as e:
+            print("backup failed:", e)
+        self.review = False
+        self._last_mark = None
         self.ctrl = ctrl
         self.ass_path = ass
         self.view.set_controller(ctrl)
@@ -451,7 +475,11 @@ class MainWindow(QMainWindow):
         tap_keys = {ord(c) for c in self.settings.tap_keys}
         if key in tap_keys:
             if not ev.isAutoRepeat():
-                (self._line_tap if lines else self._tap)(key, et == QEvent.KeyPress, now)
+                if self.review and not lines:
+                    if et == QEvent.KeyPress:
+                        self._mark_at(now)
+                else:
+                    (self._line_tap if lines else self._tap)(key, et == QEvent.KeyPress, now)
             return True
         if et != QEvent.KeyPress:
             return False
@@ -484,7 +512,17 @@ class MainWindow(QMainWindow):
                 Qt.Key_T: self.toggle_line_timing,
                 Qt.Key_E: lambda: self.extend_line(self.list.currentRow()),
                 Qt.Key_V: self.toggle_wave_mode,
+                Qt.Key_W: self.toggle_review,
+                Qt.Key_N: self.goto_next_mark,
             })
+            if self.review:
+                keys.update({
+                    Qt.Key_Backspace: self.unmark_last,
+                    Qt.Key_Return: lambda: self._mark_at(time.perf_counter()),
+                    Qt.Key_R: lambda: self._leave_review(retap=True),
+                    Qt.Key_Up: lambda: self._review_line(-1),
+                    Qt.Key_Down: lambda: self._review_line(1),
+                })
         handler = keys.get(key)
         if handler is None:
             return False
@@ -633,6 +671,8 @@ class MainWindow(QMainWindow):
         self.line_page.refresh(self.ctrl)
 
     def _on_tab(self, page: int) -> None:
+        if self.review and page != PAGE_SYLLABLES:
+            self._leave_review()
         self.held.clear()
         if self.player:
             self.player.pause()
@@ -759,27 +799,200 @@ class MainWindow(QMainWindow):
             self.player.seek(ms)
 
     def _after_drag(self, li: int) -> None:
+        self.ctrl.discard_if_unchanged()
         self._last_statuses = []
         self._refresh_list()
         self._autosave(force=True)
 
-    def undo_drag(self) -> None:
+    # -- undo / redo, backups --------------------------------------------------------------------
+    def _update_edit_menu(self) -> None:
+        c = self.ctrl
+        u, r = (c.undo_label(), c.redo_label()) if c else (None, None)
+        self.undo_action.setText(f"復原：{u}" if u else "復原")
+        self.undo_action.setEnabled(bool(u))
+        self.redo_action.setText(f"重做：{r}" if r else "重做")
+        self.redo_action.setEnabled(bool(r))
+
+    def _undo_redo(self, redo: bool) -> None:
+        if QApplication.activeModalWidget() or not self._before_structure():
+            return                      # Ctrl+Z inside a dialog is not for the project
+        label = self.ctrl.redo_edit() if redo else self.ctrl.undo_edit()
+        if label is None:
+            self.statusBar().showMessage("沒有可以重做的修改" if redo else "沒有可以復原的修改", 2000)
+            return
+        self._after_structure(self.ctrl.line_cursor if self.tabs.currentIndex() == PAGE_LINES
+                              else self.ctrl.cursor)
+        self.statusBar().showMessage(("已重做：" if redo else "已復原：") + label, 3000)
+
+    def undo_edit(self) -> None:
+        self._undo_redo(redo=False)
+
+    def redo_edit(self) -> None:
+        self._undo_redo(redo=True)
+
+    def restore_backup(self) -> None:
+        if not self._before_structure():
+            return
+        self._autosave(force=True)
+        backups = self.ctrl.backups()
+        if not backups:
+            QMessageBox.information(self, "從備份還原", "這個專案還沒有備份（開啟時和之後每 5 分鐘會自動備份一次）。")
+            return
+        labels = [summary for _, summary in backups]
+        item, ok = QInputDialog.getItem(self, "從備份還原", "選擇要還原的備份（還原後可以按 Ctrl+Z 復原）：",
+                                        labels, 0, False)
+        if not ok:
+            return
+        self.ctrl.restore_backup(backups[labels.index(item)][0])
+        self._after_structure(self.ctrl.cursor)
+        self.statusBar().showMessage("已從備份還原", 3000)
+
+    # -- review playback, marks, retapping from a syllable -----------------------------------------
+    def toggle_review(self) -> None:
+        if self.review:
+            self._leave_review()
+            return
         if not self.ctrl:
             return
-        if self.tabs.currentIndex() == PAGE_LINES:
-            li = self.ctrl.undo_line_drag()
-            if li is None:
-                self.statusBar().showMessage("沒有可以復原的拖曳", 2000)
-                return
-            self.statusBar().showMessage(f"已復原第 {li + 1} 行的拖曳", 2000)
-            self._after_line_drag(li)
+        if self.tabs.currentIndex() != PAGE_SYLLABLES:
+            self.tabs.setCurrentIndex(PAGE_SYLLABLES)
+        self.held.clear()
+        self.review = True
+        self.ctrl.review_ms = self.player.song_ms() if self.player else 0.0
+        self.statusBar().showMessage("回放檢查：照打好的時間播放，看到不對就按打軸鍵標記", 4000)
+
+    def _leave_review(self, retap: bool = False) -> None:
+        if not self.review:
             return
-        li = self.ctrl.undo_drag()
-        if li is None:
-            self.statusBar().showMessage("沒有可以復原的拖曳", 2000)
+        c = self.ctrl
+        li = c.current_line()
+        self.review = False
+        c.review_ms = None
+        self.help.set_hint(self._hint())
+        if retap:
+            self.jump(li, play=True)
+        else:
+            c.start_take(li)
+            self.list.setCurrentRow(li)
+
+    def _review_line(self, step: int) -> None:
+        c = self.ctrl
+        li = max(0, min(c.current_line() + step, len(c.lines) - 1))
+        if self.player and self.variant_key:
+            self.player.seek(c.preroll_target(li))
+
+    def _mark_at(self, now: float) -> None:
+        c = self.ctrl
+        if not c:
             return
-        self.statusBar().showMessage(f"已復原第 {li + 1} 行的拖曳", 2000)
-        self._after_drag(li)
+        target = c.mark_target(self._song_ms_of(now))
+        if target is None:
+            self.statusBar().showMessage("這裡還沒有打好的音節，不能標記", 2000)
+            return
+        li, si = target
+        self.flash_until = now + 0.09
+        marked = c.toggle_mark(li, si)
+        f = c.lines[li].furi[si]
+        self.statusBar().showMessage(f"{'已標記' if marked else '取消標記'}：第 {li + 1} 行「{f.ruby or f.base}」", 2000)
+        self._last_statuses = []
+        self._autosave(force=True)
+
+    def unmark_last(self) -> None:
+        c = self.ctrl
+        hit = c.unmark_last() if c else None
+        if hit is None:
+            self.statusBar().showMessage("沒有標記可以取消", 2000)
+            return
+        self.statusBar().showMessage(f"已取消第 {hit[0] + 1} 行的標記", 2000)
+        self._last_statuses = []
+        self._autosave(force=True)
+
+    def clear_marks(self) -> None:
+        if self.ctrl:
+            self.ctrl.clear_marks()
+            self._last_statuses = []
+            self._autosave(force=True)
+
+    def goto_next_mark(self) -> None:
+        c = self.ctrl
+        if not c:
+            return
+        start = self._last_mark if self._last_mark and self._last_mark[0] < len(c.lines) else (c.current_line(), -1)
+        mark = c.next_mark(*start)
+        if mark is None:
+            self.statusBar().showMessage("沒有標記（回放檢查時按打軸鍵標記）", 3000)
+            return
+        self._leave_review()
+        self._last_mark = mark
+        self.retap_from(*mark)
+
+    def retap_from(self, li: int, si: int) -> None:
+        """Retap line li from syllable si; the syllables before it keep their times."""
+        c = self.ctrl
+        if self.player:
+            self.player.pause()
+        self.held.clear()
+        if self.tabs.currentIndex() != PAGE_SYLLABLES:
+            self.tabs.setCurrentIndex(PAGE_SYLLABLES)
+        c.start_take(li, si)
+        if self.player and self.variant_key:
+            self.player.seek(c.take_seek_target())
+        self.list.setCurrentRow(li)
+        self._synced_syl = li
+        f = c.lines[li].furi[si]
+        if c.take.punch:
+            self.statusBar().showMessage(f"從第 {li + 1} 行「{f.ruby or f.base}」開始重打，前面的音節保留（空白鍵播放）", 5000)
+        else:
+            self.statusBar().showMessage(f"重打第 {li + 1} 行（空白鍵播放）", 4000)
+
+    def _syllable_menu(self, li: int, si: int, pos) -> None:
+        c = self.ctrl
+        if not c or li < 0:
+            return
+        menu = QMenu(self)
+        retap = menu.addAction("從這個音節開始重打")
+        retap.setEnabled(li in c.results)
+        mark = menu.addAction("取消標記" if si in c.marked(li) else "標記這個音節")
+        mark.setEnabled(li in c.results)
+        chosen = menu.exec(pos)
+        if chosen is retap:
+            self._leave_review()
+            self.retap_from(li, si)
+        elif chosen is mark:
+            c.toggle_mark(li, si)
+            self._last_statuses = []
+            self._autosave(force=True)
+
+    # -- pre-export check -----------------------------------------------------------------------------------
+    def show_check(self, for_export: bool = False) -> bool:
+        """Show the check's findings. Returns True if an export should go ahead."""
+        c = self.ctrl
+        if not c:
+            return False
+        issues = c.check()
+        if for_export and not any(i.level != "info" for i in issues):
+            return True
+        if self.player:
+            self.player.pause()
+        dlg = CheckDialog(issues, c.lines, for_export, self)
+        dlg.exec()
+        if dlg.jump_to is not None:
+            self._go_to_issue(dlg.jump_to)
+            return False
+        return dlg.export_anyway
+
+    def _go_to_issue(self, issue) -> None:
+        self._leave_review()
+        if issue.page == "lines":
+            self.tabs.setCurrentIndex(PAGE_LINES)
+            self.jump_line(issue.line)
+        elif issue.page == "layout":
+            self.tabs.setCurrentIndex(PAGE_LAYOUT)
+            self.layout_page.table.selectRow(issue.line)
+        else:
+            if self.tabs.currentIndex() != PAGE_SYLLABLES:
+                self.tabs.setCurrentIndex(PAGE_SYLLABLES)
+            self.jump(issue.line)
 
     # -- editing the line list ----------------------------------------------------------------
     def _page_list(self) -> QListWidget | None:
@@ -834,10 +1047,14 @@ class MainWindow(QMainWindow):
 
     def _after_structure(self, li: int) -> None:
         c = self.ctrl
+        if self.review:
+            self.review = False
+            c.review_ms = None
+        self._last_mark = None
         self._synced_line = self._synced_syl = -1
         self.line_page.rebuild(c)
         self._rebuild_list()
-        self.layout_page.refresh()
+        self.layout_page.set_controller(c)
         self.wave.set_controller(c)
         self.view.update()
         self.line_page.timeline.update()
@@ -951,6 +1168,7 @@ class MainWindow(QMainWindow):
         self._after_structure(self._target_line())
 
     def _after_line_drag(self, li: int) -> None:
+        self.ctrl.discard_if_unchanged()
         self.line_page.refresh(self.ctrl)
         self._last_statuses = []
         self._autosave(force=True)
@@ -1015,6 +1233,8 @@ class MainWindow(QMainWindow):
     def export(self) -> None:
         if not self.ctrl or not self.ass_path:
             return
+        if not self.show_check(for_export=True):
+            return
         default = self.ass_path.with_name(self.ass_path.stem + ".timed.ass")
         path, _ = QFileDialog.getSaveFileName(self, "匯出新 ASS", str(default), "ASS 字幕 (*.ass)")
         if not path:
@@ -1060,14 +1280,15 @@ class MainWindow(QMainWindow):
         if not self.ctrl:
             return
         c = self.ctrl
-        statuses = [(c.status(i), c.line_start(i) if not c.layout_on or c.sung_span(i) else None)
-                    for i in range(len(c.lines))]
-        for i, (line, (st, start)) in enumerate(zip(c.lines, statuses)):
-            if i < len(self._last_statuses) and self._last_statuses[i] == (st, start):
+        statuses = [(c.status(i), c.line_start(i) if not c.layout_on or c.sung_span(i) else None,
+                     len(c.marked(i))) for i in range(len(c.lines))]
+        for i, (line, (st, start, marks)) in enumerate(zip(c.lines, statuses)):
+            if i < len(self._last_statuses) and self._last_statuses[i] == (st, start, marks):
                 continue
             it = self.list.item(i)
             when = format_time(start) if start is not None else "未打行軸"
-            it.setText(f"{i + 1:>3} {STATUS_ICON[st]} {when}  {line.plain}")
+            flag = f"  ⚑{marks}" if marks else ""
+            it.setText(f"{i + 1:>3} {STATUS_ICON[st]} {when}  {line.plain}{flag}")
             it.setForeground(QColor(STATUS_COLOR[st]))
         self._last_statuses = statuses
 
@@ -1104,7 +1325,9 @@ class MainWindow(QMainWindow):
         song = self.clock.song_ms_at(now) if self.player else 0.0
         c = self.ctrl
         page = self.tabs.currentIndex()
-        if c and playing and page == PAGE_SYLLABLES:
+        if c and self.review:
+            c.review_ms = song
+        elif c and playing and page == PAGE_SYLLABLES:
             self._handle(c.tick(song, bool(self.held)))
         s = self.settings
         speed_txt = f"{s.speed:g}x" + ("（保持音高）" if s.keep_pitch else "（變調）")
@@ -1114,7 +1337,9 @@ class MainWindow(QMainWindow):
         timing = "保留行時間" if s.line_timing == KEEP else "由打軸決定行時間"
         flow = "連續" if s.continuous else "逐行"
         if c and c.layout_on:
-            timing = "奇偶版面"
+            timing = "單行版面" if c.layout_params.rows == 1 else "奇偶版面"
+        if self.review:
+            flow = "<span style='color:#ffcc33'>回放檢查</span>"
         state = "▶" if playing else "⏸"
         extra = "" if page == PAGE_LINES else f"{flow}　{timing}　"
         self.info.setText(
@@ -1129,19 +1354,23 @@ class MainWindow(QMainWindow):
             return
         if page == PAGE_LAYOUT:
             return
-        up = c.upcoming(4)
-        pressed = (bool(self.held) and s.mode == HOLD) or now < self.flash_until
+        up = c.review_upcoming(4) if self.review else c.upcoming(4)
+        pressed = (bool(self.held) and s.mode == HOLD and not self.review) or now < self.flash_until
         if self.source is None:
             msg = "載入音訊中…" if self.player else "沒有音訊輸出"
         elif not up:
-            msg = "這一輪敲完了（↑／↓ 換行，R 重敲）"
+            msg = "後面沒有打好音節的行了（W 結束回放）" if self.review else "這一輪敲完了（↑／↓ 換行，R 重敲）"
         else:
             msg = ""
         items = [cue_item(c.lines[li], si) for li, si in up]
         self.cue.set_state(items, pressed, msg)
         cur_line = c.current_line()
-        untimed = c.layout_on and c.sung_span(cur_line) is None
-        self.help.set_hint(self._hint(NO_LINE_TIMING if untimed else ""))
+        if self.review:
+            self.help.set_hint(REVIEW_HINT.format(space=key("空白"), taps=" ".join(key(t) for t in s.tap_keys),
+                                                  bs=key("Backspace"), n=key("N"), w=key("W")))
+        else:
+            untimed = c.layout_on and c.sung_span(cur_line) is None
+            self.help.set_hint(self._hint(NO_LINE_TIMING if untimed else ""))
         self.view.edit_enabled = not playing
         self.view.set_time(song)
         self.wave.set_state(song, editable=not playing)

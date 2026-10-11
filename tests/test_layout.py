@@ -29,3 +29,14 @@ def test_untimed_lines_split_segments_and_params_apply():
 
 def test_start_never_negative():
     assert place([(300, 900), (1000, 2000)], LayoutParams())[0].start == 0
+
+
+def test_one_row():
+    p = LayoutParams(rows=1, one_style="Main")
+    spans = [(10000, 12000), (12500, 14000), (14100, 15000), (25000, 27000)]
+    assert place(spans, p) == [
+        Placement(9000, 12000, "Main"),             # 1 s early
+        Placement(12300, 14000, "Main"),            # after the previous one is gone (+0.3 s)
+        Placement(14100, 15000, "Main", late=True), # no room: shown when sung
+        Placement(24000, 27000, "Main"),
+    ]
