@@ -14,21 +14,24 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QLabel, 
 from ..ass_doc import AssDocument, format_time
 from ..audio import AudioError, AudioSource, Player, pick_output_device
 from ..clock import SongClock
-from ..controller import PARTIAL, TAPPED_OK, UNTAPPED, WARNING, Action, Controller
+from ..controller import IMPORTED, PARTIAL, TAPPED_OK, UNTAPPED, WARNING, Action, Controller
 from ..karaoke import merge_syllables, split_syllable
 from ..settings import Settings
 from ..timing import HOLD, KEEP, ONSET, TAPPED
 from .dialogs import CalibrationDialog, SettingsDialog
+from .wave import WaveView
 from .widgets import CueWidget, LineView, cue_item, jp_font
 
-STATUS_ICON = {UNTAPPED: "○", TAPPED_OK: "●", WARNING: "⚠", PARTIAL: "◐"}
-STATUS_COLOR = {UNTAPPED: "#9aa0aa", TAPPED_OK: "#4fa3ff", WARNING: "#ff5c5c", PARTIAL: "#ffcc33"}
+STATUS_ICON = {UNTAPPED: "○", TAPPED_OK: "●", WARNING: "⚠", PARTIAL: "◐", IMPORTED: "◆"}
+STATUS_COLOR = {UNTAPPED: "#9aa0aa", TAPPED_OK: "#4fa3ff", WARNING: "#ff5c5c", PARTIAL: "#ffcc33",
+                IMPORTED: "#7fd1b9"}
 
 HELP = """打軸鍵：{taps}（可多鍵交替／雙押）　結束鍵：{end}
 空白：播放／暫停　←／→：倒退／前進 2 秒
 R：重敲本行　Backspace：復原上一下　↑／↓：上一行／下一行　Ctrl+G：跳到第幾行
 M：長按／起點模式　S：切換速度　P：保持音高　C：逐行／連續　T：行時間模式
 E：延長選取行的行時間（敲出界時）　暫停時點目前那行字與字之間：切開／合併音節（紫線＝可合併的分界，灰線＝不能合併的分界，點＝可切開處）
+V：波形／頻譜　暫停時拖曳波形上的邊界微調（Shift＋拖曳＝行頭／行尾）　點波形＝移動播放位置　Ctrl+Z：復原拖曳
 Ctrl+S：存進度　Ctrl+E：匯出新 ASS　Ctrl+L：延遲校正　Ctrl+,：設定"""
 
 
@@ -76,6 +79,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("karatap 卡拉OK打軸")
         self.cue = CueWidget()
         self.view = LineView()
+        self.wave = WaveView()
+        self.wave.set_mode(settings.wave_mode)
+        self.wave.seek_requested.connect(self.seek_to)
+        self.wave.changed.connect(self._after_drag)
         self.info = QLabel()
         self.info.setFont(jp_font(15, bold=False))
         self.info.setTextFormat(Qt.RichText)
@@ -95,6 +102,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.info)
         lay.addWidget(self.cue, 3)
         lay.addWidget(self.view, 2)
+        lay.addWidget(self.wave, 2)
         lay.addWidget(self.help)
         split = QSplitter()
         split.addWidget(self.list)
@@ -141,6 +149,8 @@ class MainWindow(QMainWindow):
         act(m, "還原目前這行的音節切分", self.revert_split)
         m = self.menuBar().addMenu("工具")
         act(m, "延遲校正…", self.calibrate, "Ctrl+L")
+        act(m, "切換波形／頻譜 (V)", self.toggle_wave_mode)
+        act(m, "復原上一次拖曳", self.undo_drag, "Ctrl+Z")
         act(m, "設定…", self.open_settings, "Ctrl+,")
 
     def _update_help(self) -> None:
@@ -167,9 +177,13 @@ class MainWindow(QMainWindow):
             ctrl.load_progress()
         except (OSError, ValueError, KeyError) as e:
             QMessageBox.warning(self, "進度檔", f"讀取進度失敗，從頭開始：{e}")
+        imported = ctrl.import_file_timing()
         self.ctrl = ctrl
         self.ass_path = ass
         self.view.set_controller(ctrl)
+        self.wave.set_controller(ctrl)
+        if imported:
+            self.statusBar().showMessage(f"有 {imported} 行沿用檔案裡原有的 \\k（◆），重敲或拖曳後才會改", 6000)
         self.setWindowTitle(f"karatap — {ass.name}")
         self._rebuild_list()
         for msg in ctrl.load_messages:
@@ -218,6 +232,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "音訊載入失敗", err)
             return
         self.source = src
+        self.wave.set_audio(src.base, src.sr)
         self.apply_variant()
         for sp in self.settings.speeds:     # pre-render the other speeds in the background
             self._queue_render(sp, self.settings.keep_pitch)
@@ -314,6 +329,7 @@ class MainWindow(QMainWindow):
             Qt.Key_C: self.toggle_continuous,
             Qt.Key_T: self.toggle_line_timing,
             Qt.Key_E: lambda: self.extend_line(self.list.currentRow()),
+            Qt.Key_V: self.toggle_wave_mode,
         }.get(key)
         if handler is None:
             return False
@@ -511,6 +527,30 @@ class MainWindow(QMainWindow):
             self._refresh_list()
             self._autosave(force=True)
 
+    def seek_to(self, ms: float) -> None:
+        if self.player and self.variant_key:
+            self.player.seek(ms)
+
+    def _after_drag(self, li: int) -> None:
+        self._last_statuses = []
+        self._refresh_list()
+        self._autosave(force=True)
+
+    def undo_drag(self) -> None:
+        if not self.ctrl:
+            return
+        li = self.ctrl.undo_drag()
+        if li is None:
+            self.statusBar().showMessage("沒有可以復原的拖曳", 2000)
+            return
+        self.statusBar().showMessage(f"已復原第 {li + 1} 行的拖曳", 2000)
+        self._after_drag(li)
+
+    def toggle_wave_mode(self) -> None:
+        self.settings.wave_mode = "spec" if self.settings.wave_mode == "wave" else "wave"
+        self.settings.save()
+        self.wave.set_mode(self.settings.wave_mode)
+
     def clear_selected(self) -> None:
         li = self.list.currentRow()
         if self.ctrl and li >= 0:
@@ -646,6 +686,7 @@ class MainWindow(QMainWindow):
         self.cue.set_state(items, pressed, msg)
         self.view.edit_enabled = not playing
         self.view.set_time(song)
+        self.wave.set_state(song, editable=not playing)
         cur = c.current_line()
         if self.list.currentRow() != cur and not self.list.underMouse():
             self.list.setCurrentRow(cur)

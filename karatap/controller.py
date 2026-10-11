@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .ass_doc import AssDocument, Event, format_time
@@ -17,10 +18,13 @@ from .karaoke import Furi, KaraLine, furigana_for
 from .settings import Settings
 from .timing import KEEP, TAPPED, LineTiming, TapMachine, TimingOptions, compute_line, to_cs
 
-UNTAPPED, TAPPED_OK, WARNING, PARTIAL = "untapped", "tapped", "warning", "partial"
+UNTAPPED, TAPPED_OK, WARNING, PARTIAL, IMPORTED = "untapped", "tapped", "warning", "partial", "imported"
+FROM_TAPS, FROM_FILE = "tap", "file"     # LineResult.source
 
 LOOP_GRACE_MS = 1500     # line mode: replay the line if it ends this long without being finished
 SKIP_GRACE_MS = 300      # continuous mode: skip a line nobody touched once it is this far past its end
+IMPORT_MIN_FILL = 0.5    # a line's \k must cover this much of it to count as already timed
+DRAG_UNDO_LIMIT = 100
 
 
 @dataclass
@@ -53,8 +57,33 @@ def make_line(idx: int, event: Event, text: str) -> LineInfo:
 @dataclass
 class LineResult:
     bounds: list[tuple[float, float]]
-    start_override: int | None = None    # ms; set by "extend line"
+    start_override: int | None = None    # ms; set by "extend line" or dragging the line edge
     end_override: int | None = None
+    source: str = FROM_TAPS              # FROM_FILE: \k already in the ASS, untouched so far
+
+
+def file_bounds(line: LineInfo) -> list[tuple[float, float]] | None:
+    """Syllable (start, end) from the \\k values already in the ASS, or None if they look like placeholders."""
+    start, end = line.event.start_ms, line.event.end_ms
+    total = sum(s.value for s in line.kara.syls) * 10
+    if end <= start or total < IMPORT_MIN_FILL * (end - start):
+        return None
+    t, out = float(start), []
+    for s in line.kara.syls:
+        a, t = t, t + s.value * 10
+        if not s.is_gap:
+            out.append((a, t))
+    return out
+
+
+@dataclass
+class Handle:
+    """A draggable boundary on the waveform. refs: ('s', j) / ('e', j) for syllable
+    start/end, ('L0',) / ('L1',) for the line edges; a shared boundary has two refs."""
+    ms: float
+    lo: float
+    hi: float
+    refs: tuple
 
 
 @dataclass
@@ -101,6 +130,7 @@ class Controller:
         self.take: Take | None = None
         self.dirty = False
         self.load_messages: list[str] = []
+        self.drag_history: list[tuple[int, LineResult | None]] = []
 
     # -- options -----------------------------------------------------------------
     def timing_options(self) -> TimingOptions:
@@ -139,7 +169,21 @@ class Controller:
                 if any(m.start[i] is not None for i in self.take.line_targets(li)):
                     return PARTIAL
             return UNTAPPED
-        return WARNING if t.warnings else TAPPED_OK
+        if t.warnings:
+            return WARNING
+        return IMPORTED if self.results[li].source == FROM_FILE else TAPPED_OK
+
+    def import_file_timing(self) -> int:
+        """Use \\k already in the ASS as the result of lines that have none. Returns how many."""
+        n = 0
+        for li, line in enumerate(self.lines):
+            if li in self.results or line.edited:
+                continue
+            b = file_bounds(line)
+            if b:
+                self.results[li] = LineResult(b, source=FROM_FILE)
+                n += 1
+        return n
 
     def extend_line(self, li: int) -> None:
         """Grow the line's start/end to cover taps that fell outside it."""
@@ -152,7 +196,64 @@ class Controller:
             r.start_override = first
         if last > self.line_end(li):
             r.end_override = last
+        r.source = FROM_TAPS
         self.dirty = True
+
+    # -- dragging boundaries on the waveform --------------------------------------------
+    def handles(self, li: int) -> list[Handle]:
+        r = self.results.get(li)
+        if not r:
+            return []
+        b = r.bounds
+        out: list[Handle] = []
+        for j, (s, e) in enumerate(b):
+            if j and abs(b[j - 1][1] - s) < 1.0:            # previous end == this start: one handle
+                out.append(Handle(s, b[j - 1][0], e, (("e", j - 1), ("s", j))))
+                continue
+            if j:
+                out.append(Handle(b[j - 1][1], b[j - 1][0], s, (("e", j - 1),)))
+            out.append(Handle(s, b[j - 1][1] if j else 0.0, e, (("s", j),)))
+        out.append(Handle(b[-1][1], b[-1][0], math.inf, (("e", len(b) - 1),)))
+        if self.settings.line_timing == KEEP:
+            out.append(Handle(self.line_start(li), 0.0, b[0][0], (("L0",),)))
+            out.append(Handle(self.line_end(li), b[-1][1], math.inf, (("L1",),)))
+        return out
+
+    def begin_drag(self, li: int) -> None:
+        """Remember line li's result so the coming drag can be undone."""
+        r = self.results.get(li)
+        self.drag_history.append((li, replace(r, bounds=list(r.bounds)) if r else None))
+        del self.drag_history[:-DRAG_UNDO_LIMIT]
+
+    def move_handle(self, li: int, h: Handle, ms: float) -> float:
+        """Move a boundary (10 ms steps, kept between its neighbours). Returns where it landed."""
+        r = self.results[li]
+        ms = min(max(round(ms / 10) * 10, h.lo), h.hi)
+        ev = self.lines[li].event
+        for ref in h.refs:
+            if ref[0] == "s":
+                r.bounds[ref[1]] = (ms, r.bounds[ref[1]][1])
+            elif ref[0] == "e":
+                r.bounds[ref[1]] = (r.bounds[ref[1]][0], ms)
+            elif ref[0] == "L0":
+                r.start_override = None if ms == ev.start_ms else int(ms)
+            else:
+                r.end_override = None if ms == ev.end_ms else int(ms)
+        r.source = FROM_TAPS
+        self.dirty = True
+        return ms
+
+    def undo_drag(self) -> int | None:
+        """Undo the last drag. Returns the line it changed."""
+        if not self.drag_history:
+            return None
+        li, prev = self.drag_history.pop()
+        if prev is None:
+            self.results.pop(li, None)
+        else:
+            self.results[li] = prev
+        self.dirty = True
+        return li
 
     def clear_line(self, li: int) -> None:
         if self.results.pop(li, None) is not None:
@@ -343,8 +444,10 @@ class Controller:
                 if line.edited:       # untapped, but its syllable split was changed
                     repl[ev.line_no] = ev.with_fields(text=line.kara.text).render()
                 continue
-            changes = {"text": line.kara.rebuild(timing.values, timing.inserts)}
             r = self.results[li]
+            if r.source == FROM_FILE:  # \k from the file, untouched: keep the line as it is
+                continue
+            changes = {"text": line.kara.rebuild(timing.values, timing.inserts)}
             if (self.settings.line_timing == TAPPED or r.start_override is not None
                     or r.end_override is not None):
                 if timing.start_cs * 10 != ev.start_ms:
@@ -370,7 +473,7 @@ class Controller:
                     "start_override": r.start_override,
                     "end_override": r.end_override,
                 }
-                for li, r in sorted(self.results.items())
+                for li, r in sorted(self.results.items()) if r.source != FROM_FILE
             },
             "edits": {
                 l.key: {"text": l.event.text, "edited": l.kara.text}
