@@ -21,15 +21,19 @@ def selftest(report: Path) -> int:
         from .audio import has_rubberband, pick_output_device
         from .settings import Settings
         from .ui.main_window import MainWindow
+        from .ui.widgets import apply_ui_font
 
         lines.append(f"numpy {numpy.__version__}, sounddevice {sounddevice.__version__}, "
                      f"portaudio {sounddevice.get_portaudio_version()[1]}")
         app = QApplication(sys.argv[:1])
+        apply_ui_font(app)
         win = MainWindow(Settings())
         app.processEvents()
         if win.player:
             win.player.close()
         lines.append(f"window ok, audio output: {pick_output_device()}")
+        from .readings import kanji_table
+        lines.append(f"kanji readings: {len(kanji_table())}")
         ff = shutil.which("ffmpeg")
         lines.append(f"ffmpeg: {ff or 'NOT FOUND'}" + (f", rubberband: {has_rubberband()}" if ff else ""))
         ok = ff is not None
@@ -48,9 +52,11 @@ def main() -> int:
 
     from .settings import Settings
     from .ui.main_window import MainWindow
+    from .ui.widgets import apply_ui_font
 
     app = QApplication(sys.argv)
     app.setApplicationName("karatap")
+    apply_ui_font(app)
     win = MainWindow(Settings.load())
     win.show()
     args = [a for a in sys.argv[1:] if not a.startswith("-")]

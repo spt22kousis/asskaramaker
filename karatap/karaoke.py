@@ -136,13 +136,14 @@ class KaraLine:
 def atoms(text: str) -> list[str]:
     """Smallest pieces a syllable can be split into, concatenating back to `text`.
 
-    Each kana / kanji / digit is a piece; small kana join the previous one;
+    Each kana / kanji / digit / symbol (♡) is a piece; small kana join the previous one;
     an English word stays whole; punctuation and spaces join a neighbour
     (opening brackets the next piece, everything else the previous one).
     """
     out: list[str] = []
     pending = ""            # punctuation waiting for the next piece
     word = False            # last piece is an English word still being read
+    quotes = 0
     for ch in text:
         if ch in SMALL_KANA and out and not pending:
             out[-1] += ch
@@ -154,12 +155,16 @@ def atoms(text: str) -> list[str]:
                 out.append(pending + ch)
                 pending = ""
                 word = True
-        elif ch.isalnum():
+        elif ch.isalnum() or unicodedata.category(ch) == "So":     # ♡ ♪ may be sung
             out.append(pending + ch)
             pending = ""
             word = False
         else:
-            if ch in OPENING or not out:
+            opening = ch in OPENING
+            if ch == '"':               # straight quotes alternate: 1st, 3rd, ... open
+                opening = quotes % 2 == 0
+                quotes += 1
+            if opening or not out:
                 pending += ch
             elif pending:
                 pending += ch

@@ -8,7 +8,7 @@ from PySide6.QtWidgets import QWidget
 
 from ..controller import Controller, Handle
 from ..waveform import colormap, peaks, spectrogram
-from .widgets import ACTIVE, BG, DIM, DONE, FG, WARN, jp_font
+from .widgets import ACTIVE, BG, DIM, DONE, FG, WARN, ui_font
 
 GRAB_PX = 7          # how close the mouse must be to a boundary to grab it
 LINE_EDGE = QColor("#e8e8ea")
@@ -33,7 +33,7 @@ class WaveView(QWidget):
         self._range: tuple[float, float] | None = None
         self._drag: tuple[int, Handle] | None = None
         self._frozen: tuple[float, float] | None = None
-        self.setMinimumHeight(140)
+        self.setMinimumHeight(100)
         self.setMouseTracking(True)
 
     # -- inputs ------------------------------------------------------------------------
@@ -159,7 +159,7 @@ class WaveView(QWidget):
             p.drawRect(QRectF(x_prev, 0, self.width() - x_prev, h))
 
         # Syllable spans with labels.
-        label_font = jp_font(13)
+        label_font = ui_font(13, bold=True)
         fm = QFontMetricsF(label_font)
         p.setFont(label_font)
         for j, (s, e) in enumerate(bounds):

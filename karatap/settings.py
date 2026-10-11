@@ -37,6 +37,9 @@ class Settings:
     end_key: str = "L"
     metronome_bpm: float = 100.0
     wave_mode: str = "wave"            # 'wave' or 'spec' under the line view
+    last_template: str = ""            # new-project wizard: template ASS used last time
+    last_dir: str = ""                 # ...and the folder media was last picked from
+    help_open: bool = True             # full key help shown at the top of the tapping pages
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":

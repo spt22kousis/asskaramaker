@@ -5,6 +5,7 @@
 Needs PyInstaller in the venv. ffmpeg is not bundled: users install it and
 put it on PATH.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ def main() -> int:
     subprocess.run([
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
         "--name", "karatap", "--paths", str(ROOT),
+        "--add-data", f"{ROOT / 'karatap' / 'data'}{os.pathsep}karatap/data",
         "--distpath", str(dist), "--workpath", str(build), "--specpath", str(build),
         # Qt modules the app never uses; keeps the zip small
         *[a for m in ("QtWebEngineCore", "QtWebEngineWidgets", "QtPdf", "QtQuick", "QtQml",

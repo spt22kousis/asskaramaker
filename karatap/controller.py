@@ -10,11 +10,12 @@ import hashlib
 import json
 import math
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 
 from .ass_doc import AssDocument, Event, format_time
 from .karaoke import Furi, KaraLine, furigana_for
+from .layout import LayoutParams, Placement, place
 from .settings import Settings
 from .timing import KEEP, TAPPED, LineTiming, TapMachine, TimingOptions, compute_line, to_cs
 
@@ -47,6 +48,12 @@ class LineInfo:
     def edited(self) -> bool:
         """Syllable split changed in the tool (export writes the new text)."""
         return self.kara.text != self.event.text
+
+    @property
+    def plain(self) -> str:
+        """The line's text without furigana."""
+        return "".join(s.text if s.is_gap else f.base
+                       for f, s in zip(self.furi, self.kara.syls) if not f.continuation)
 
 
 def make_line(idx: int, event: Event, text: str) -> LineInfo:
@@ -104,10 +111,23 @@ class Take:
 
 
 @dataclass
+class LineTake:
+    """Tapping whole lines (one press or hold per line), from line `first` on."""
+    first: int
+    machine: TapMachine
+    committed: set[int] = field(default_factory=set)
+    backup: dict[int, tuple[float, float] | None] = field(default_factory=dict)
+
+
+@dataclass
 class Action:
     kind: str            # 'seek', 'ask_oob'
     ms: float = 0.0
     line: int = -1
+
+
+def progress_path_for(ass: Path) -> Path:
+    return ass.with_suffix(".karatap.json")
 
 
 def _sha1(b: bytes) -> str:
@@ -130,24 +150,75 @@ class Controller:
         self.take: Take | None = None
         self.dirty = False
         self.load_messages: list[str] = []
-        self.drag_history: list[tuple[int, LineResult | None]] = []
+        self.drag_history: list[tuple[int, LineResult | None, tuple | None]] = []
+        # Line timing: sung (start, end) per line from line tapping.
+        self.line_taps: dict[int, tuple[float, float]] = {}
+        self.line_take: LineTake | None = None
+        self.line_cursor = 0
+        # Odd/Even layout: when on, line times and styles come from layout.place().
+        self.layout_on = False
+        self.layout_params = LayoutParams()
+        self.layout_overrides: dict[int, tuple[int | None, int | None]] = {}   # manual start/end
 
     # -- options -----------------------------------------------------------------
     def timing_options(self) -> TimingOptions:
         s = self.settings
-        return TimingOptions(s.line_timing, s.gap_policy, s.pre_pad_ms, s.post_pad_ms)
+        line_timing = KEEP if self.layout_on else s.line_timing   # the layout already decided the line times
+        return TimingOptions(line_timing, s.gap_policy, s.pre_pad_ms, s.post_pad_ms)
 
-    def line_start(self, li: int) -> int:
+    def line_start(self, li: int) -> float:
+        if self.layout_on:
+            return self._layout_span(li)[0]
         r = self.results.get(li)
         if r and r.start_override is not None:
             return r.start_override
         return self.lines[li].event.start_ms
 
-    def line_end(self, li: int) -> int:
+    def line_end(self, li: int) -> float:
+        if self.layout_on:
+            return self._layout_span(li)[1]
         r = self.results.get(li)
         if r and r.end_override is not None:
             return r.end_override
         return self.lines[li].event.end_ms
+
+    # -- layout --------------------------------------------------------------------
+    def sung_span(self, li: int) -> tuple[float, float] | None:
+        """When the line is sung: its syllables if tapped, else its line tap.
+
+        Without the layout the line's own times count; with it they are the
+        layout's output, so untapped lines have no span.
+        """
+        r = self.results.get(li)
+        if r:
+            return r.bounds[0][0], r.bounds[-1][1]
+        if li in self.line_taps:
+            return self.line_taps[li]
+        if not self.layout_on:
+            ev = self.lines[li].event
+            return float(ev.start_ms), float(ev.end_ms)
+        return None
+
+    def placements(self) -> list[Placement | None]:
+        return place([self.sung_span(i) for i in range(len(self.lines))], self.layout_params)
+
+    def _layout_span(self, li: int) -> tuple[float, float]:
+        pl = self.placements()
+        p = pl[li]
+        if p is None:
+            # Not timed yet: assume it fills the gap between its timed neighbours.
+            start = next((pl[k].end for k in range(li - 1, -1, -1) if pl[k]), 0.0)
+            end = next((pl[k].start for k in range(li + 1, len(pl)) if pl[k]), None)
+            return start, end if end is not None and end > start else start + 10000.0
+        s, e = self.layout_overrides.get(li, (None, None))
+        return (p.start if s is None else s), (p.end if e is None else e)
+
+    def set_layout_override(self, li: int, start: int | None, end: int | None) -> None:
+        if start is None and end is None:
+            self.layout_overrides.pop(li, None)
+        else:
+            self.layout_overrides[li] = (start, end)
+        self.dirty = True
 
     def preroll_target(self, li: int) -> float:
         return max(0.0, self.line_start(li) - self.settings.preroll_ms)
@@ -190,6 +261,9 @@ class Controller:
         r = self.results.get(li)
         if not r:
             return
+        if self.layout_on:          # taps only fall outside a manual override: drop it
+            self.set_layout_override(li, None, None)
+            return
         first = to_cs(r.bounds[0][0]) * 10
         last = to_cs(r.bounds[-1][1]) * 10
         if first < self.line_start(li):
@@ -214,7 +288,7 @@ class Controller:
                 out.append(Handle(b[j - 1][1], b[j - 1][0], s, (("e", j - 1),)))
             out.append(Handle(s, b[j - 1][1] if j else 0.0, e, (("s", j),)))
         out.append(Handle(b[-1][1], b[-1][0], math.inf, (("e", len(b) - 1),)))
-        if self.settings.line_timing == KEEP:
+        if self.settings.line_timing == KEEP or self.layout_on:
             out.append(Handle(self.line_start(li), 0.0, b[0][0], (("L0",),)))
             out.append(Handle(self.line_end(li), b[-1][1], math.inf, (("L1",),)))
         return out
@@ -222,7 +296,8 @@ class Controller:
     def begin_drag(self, li: int) -> None:
         """Remember line li's result so the coming drag can be undone."""
         r = self.results.get(li)
-        self.drag_history.append((li, replace(r, bounds=list(r.bounds)) if r else None))
+        self.drag_history.append((li, replace(r, bounds=list(r.bounds)) if r else None,
+                                  self.layout_overrides.get(li)))
         del self.drag_history[:-DRAG_UNDO_LIMIT]
 
     def move_handle(self, li: int, h: Handle, ms: float) -> float:
@@ -230,11 +305,19 @@ class Controller:
         r = self.results[li]
         ms = min(max(round(ms / 10) * 10, h.lo), h.hi)
         ev = self.lines[li].event
+        p = self.placements()[li] if self.layout_on else None
         for ref in h.refs:
             if ref[0] == "s":
                 r.bounds[ref[1]] = (ms, r.bounds[ref[1]][1])
             elif ref[0] == "e":
                 r.bounds[ref[1]] = (r.bounds[ref[1]][0], ms)
+            elif p is not None:                 # the layout's line edges: a manual override
+                s, e = self.layout_overrides.get(li, (None, None))
+                if ref[0] == "L0":
+                    s = None if ms == to_cs(p.start) * 10 else int(ms)
+                else:
+                    e = None if ms == to_cs(p.end) * 10 else int(ms)
+                self.set_layout_override(li, s, e)
             elif ref[0] == "L0":
                 r.start_override = None if ms == ev.start_ms else int(ms)
             else:
@@ -247,11 +330,15 @@ class Controller:
         """Undo the last drag. Returns the line it changed."""
         if not self.drag_history:
             return None
-        li, prev = self.drag_history.pop()
+        li, prev, override = self.drag_history.pop()
         if prev is None:
             self.results.pop(li, None)
         else:
             self.results[li] = prev
+        if override is None:
+            self.layout_overrides.pop(li, None)
+        else:
+            self.layout_overrides[li] = override
         self.dirty = True
         return li
 
@@ -399,7 +486,7 @@ class Controller:
         if self.settings.continuous:
             return None
         timing = self.timing_for(li)
-        if timing and timing.warnings and self.settings.line_timing == KEEP:
+        if timing and timing.warnings and (self.settings.line_timing == KEEP or self.layout_on):
             return Action("ask_oob", line=li)
         nxt = li + 1
         take = self.take
@@ -434,12 +521,125 @@ class Controller:
             return Action("seek", self.preroll_target(li), li)
         return None
 
+    # -- line tapping (whole lines, before the syllables) ---------------------------------
+    def start_line_take(self, li: int) -> None:
+        li = max(0, min(li, len(self.lines) - 1))
+        n = len(self.lines) - li
+        s = self.settings
+        # Every line is "last" for the onset mode's release rule: release (or the end key) ends it.
+        self.line_take = LineTake(li, TapMachine(n, s.mode, [True] * n, s.onset_end))
+        self.line_cursor = li
+
+    def _ensure_line_take(self) -> LineTake:
+        if self.line_take is None:
+            self.start_line_take(self.line_cursor)
+        return self.line_take
+
+    def line_current(self) -> int:
+        """The line the next press starts."""
+        t = self.line_take
+        if t is None:
+            return self.line_cursor
+        return t.first + min(t.machine.next, t.machine.n - 1)
+
+    def line_state(self, li: int) -> str:
+        """'active' / 'next' while tapping; else 'syllables', 'tapped' or 'todo'."""
+        t = self.line_take
+        if t and li >= t.first:
+            k, m = li - t.first, t.machine
+            if k == m.open_target:
+                return "active"
+            if k == m.next:
+                return "next"
+        if li in self.results:
+            return "syllables"
+        return "tapped" if li in self.line_taps else "todo"
+
+    def line_seek_target(self, li: int) -> float:
+        """Where to start playing to tap line li."""
+        sp = self.sung_span(li)
+        if sp:
+            return max(0.0, sp[0] - self.settings.preroll_ms)
+        for k in range(li - 1, -1, -1):
+            sp = self.sung_span(k)
+            if sp:
+                return max(0.0, sp[1] - self.settings.preroll_ms)
+        return 0.0
+
+    def line_down(self, key, t: float) -> list[int]:
+        if self._ensure_line_take().machine.down(key, t) is None:
+            return []
+        return self._line_sync()
+
+    def line_up(self, key, t: float) -> list[int]:
+        if self._ensure_line_take().machine.up(key, t) is None:
+            return []
+        return self._line_sync()
+
+    def line_end_key(self, t: float) -> list[int]:
+        if self._ensure_line_take().machine.end_key(t) is None:
+            return []
+        return self._line_sync()
+
+    def line_undo(self) -> float | None:
+        """Undo the last line press. Returns the song ms to rewind to, or None."""
+        if self.line_take is None:
+            return None
+        r = self.line_take.machine.undo()
+        if r is None:
+            return None
+        self._line_sync()
+        return max(0.0, r[1] - self.settings.preroll_ms)
+
+    def _line_sync(self) -> list[int]:
+        """Store finished lines; restore lines an undo reopened. Returns newly finished lines."""
+        t = self.line_take
+        m = t.machine
+        done = []
+        for k in range(m.n):
+            li = t.first + k
+            if m.is_done(k):
+                if li not in t.committed:
+                    t.backup.setdefault(li, self.line_taps.get(li))
+                    self.line_taps[li] = (m.start[k], m.end[k])
+                    t.committed.add(li)
+                    done.append(li)
+            elif li in t.committed:
+                t.committed.discard(li)
+                prev = t.backup.pop(li, None)
+                if prev is None:
+                    self.line_taps.pop(li, None)
+                else:
+                    self.line_taps[li] = prev
+        self.line_cursor = self.line_current()
+        self.dirty = True
+        return done
+
+    def clear_line_tap(self, li: int) -> None:
+        if self.line_taps.pop(li, None) is not None:
+            self.dirty = True
+
     # -- export ------------------------------------------------------------------
     def export_bytes(self) -> bytes:
         repl: dict[int, str] = {}
+        placements = self.placements() if self.layout_on else None
         for li, line in enumerate(self.lines):
             timing = self.timing_for(li)
             ev = line.event
+            if placements is not None and placements[li] is not None:
+                # The layout decides every timed line's times and style.
+                if timing:
+                    text = line.kara.rebuild(timing.values, timing.inserts)
+                    start, end = timing.start_cs * 10, timing.end_cs * 10
+                else:           # only the line was tapped: keep the placeholder \k
+                    text = line.kara.text
+                    start, end = to_cs(self.line_start(li)) * 10, to_cs(self.line_end(li)) * 10
+                new_ev = ev.with_fields(text=text, style=placements[li].style,
+                                        start=format_time(start, like=ev.get("start")),
+                                        end=format_time(end, like=ev.get("end")))
+                if new_ev.render() != self.doc.lines[ev.line_no]:
+                    repl[ev.line_no] = new_ev.render()
+                continue
             if timing is None:
                 if line.edited:       # untapped, but its syllable split was changed
                     repl[ev.line_no] = ev.with_fields(text=line.kara.text).render()
@@ -466,6 +666,7 @@ class Controller:
             "version": 1,
             "ass_sha1": _sha1(self.doc.raw),
             "cursor": self.cursor,
+            "line_cursor": self.line_cursor,
             "lines": {
                 self.lines[li].key: {
                     "text": self.lines[li].event.text,
@@ -478,6 +679,18 @@ class Controller:
             "edits": {
                 l.key: {"text": l.event.text, "edited": l.kara.text}
                 for l in self.lines if l.edited
+            },
+            "line_taps": {
+                self.lines[li].key: {"text": self.lines[li].event.text, "span": list(sp)}
+                for li, sp in sorted(self.line_taps.items())
+            },
+            "layout": {
+                "on": self.layout_on,
+                "params": asdict(self.layout_params),
+                "overrides": {
+                    self.lines[li].key: {"text": self.lines[li].event.text, "start": s, "end": e}
+                    for li, (s, e) in sorted(self.layout_overrides.items())
+                },
             },
         }
 
@@ -521,7 +734,24 @@ class Controller:
                 continue
             self.results[line.idx] = LineResult([tuple(b) for b in rec["bounds"]],
                                                 rec.get("start_override"), rec.get("end_override"))
+        for key, rec in data.get("line_taps", {}).items():
+            line = find(key, rec["text"])
+            if line is None:
+                dropped += 1
+                continue
+            self.line_taps[line.idx] = tuple(rec["span"])
+        layout = data.get("layout")
+        if layout:
+            self.layout_on = bool(layout.get("on"))
+            known = {f.name for f in fields(LayoutParams)}
+            self.layout_params = LayoutParams(**{k: v for k, v in layout.get("params", {}).items()
+                                                 if k in known})
+            for key, rec in layout.get("overrides", {}).items():
+                line = find(key, rec["text"])
+                if line is not None:
+                    self.layout_overrides[line.idx] = (rec.get("start"), rec.get("end"))
         self.cursor = min(max(0, int(data.get("cursor", 0))), max(0, len(self.lines) - 1))
+        self.line_cursor = min(max(0, int(data.get("line_cursor", 0))), max(0, len(self.lines) - 1))
         if data.get("ass_sha1") != _sha1(self.doc.raw):
             self.load_messages.append("ASS 檔在上次存檔後有變動，已依行內容比對進度。")
         if dropped:

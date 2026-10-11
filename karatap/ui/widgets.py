@@ -11,6 +11,8 @@ from ..controller import Controller, LineInfo
 from ..karaoke import merge_syllables, split_points, split_syllable
 
 JP_FONTS = ["Noto Sans JP", "Yu Gothic UI", "Yu Gothic", "Meiryo", "MS Gothic", "Microsoft JhengHei"]
+# Small interface text uses Windows' own UI font: it is hinted for small sizes, Noto Sans JP is not.
+UI_FONTS = ["Microsoft JhengHei UI", "Microsoft JhengHei", "Yu Gothic UI", "Meiryo UI", "Noto Sans JP"]
 
 BG = QColor("#16181d")
 FG = QColor("#e8e8ea")
@@ -46,11 +48,28 @@ def ruby_layout(base: str, ruby_w: float, bm: QFontMetricsF) -> tuple[float, flo
 
 
 def jp_font(px: float, bold: bool = True) -> QFont:
+    """Big lyrics: Japanese glyph shapes."""
     f = QFont()
     f.setFamilies(JP_FONTS)
     f.setPixelSize(max(1, int(px)))
     f.setBold(bold)
     return f
+
+
+def ui_font(px: float, bold: bool = False) -> QFont:
+    """Labels, lists, help and other small text."""
+    f = QFont()
+    f.setFamilies(UI_FONTS)
+    f.setPixelSize(max(1, int(px)))
+    f.setBold(bold)
+    return f
+
+
+def apply_ui_font(app) -> None:
+    """Default font of every widget (menus, buttons, forms, dialogs)."""
+    f = app.font()
+    f.setFamilies(UI_FONTS)
+    app.setFont(f)
 
 
 @dataclass
@@ -77,7 +96,7 @@ class CueWidget(QWidget):
         self.items: list[CueItem] = []
         self.pressed = False
         self.message = ""
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(170)
 
     def set_state(self, items: list[CueItem], pressed: bool, message: str = "") -> None:
         if (items, pressed, message) != (self.items, self.pressed, self.message):
@@ -159,7 +178,7 @@ class CueWidget(QWidget):
                 p.drawText(QRectF(x, y - rm.ascent(), w, rm.height()), Qt.AlignCenter, part)
                 x += w
         if main and it.continuation:
-            p.setFont(jp_font(size * 0.16, bold=False))
+            p.setFont(ui_font(size * 0.16))
             p.setPen(DIM)
             p.drawText(QRectF(cx - size * 2, base_rect.bottom(), size * 4, size * 0.22),
                        Qt.AlignHCenter | Qt.AlignTop, "（同一字的下一拍）")
@@ -217,7 +236,7 @@ class LineView(QWidget):
         self._spot_line = -1
         self._ruby_bottom = 0.0
         self._hit = 0.0
-        self.setMinimumHeight(250)
+        self.setMinimumHeight(170)
 
     def mousePressEvent(self, ev) -> None:
         if not self.edit_enabled or not self._spots or ev.button() != Qt.LeftButton:
@@ -275,7 +294,7 @@ class LineView(QWidget):
         x = (self.width() - total) / 2
         status = c.status(li)
         label = f"{li + 1}"
-        p.setFont(jp_font(max(10.0, size * 0.35), bold=False))
+        p.setFont(ui_font(max(10.0, size * 0.35)))
         p.setPen(WARN if status == "warning" else DIM)
         p.drawText(QRectF(4, baseline - bm.ascent(), 60, bm.height()), Qt.AlignLeft | Qt.AlignVCenter,
                    label + (" ⚠" if status == "warning" else ""))

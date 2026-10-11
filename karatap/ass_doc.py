@@ -179,6 +179,16 @@ class AssDocument:
                     return v.strip()
         return None
 
+    def style_names(self) -> list[str]:
+        names, cur = [], None
+        for line in self.lines:
+            m = _SECTION_RE.match(line)
+            if m:
+                cur = m.group(1).strip().lower()
+            elif cur in ("v4+ styles", "v4 styles") and line.lower().startswith("style:"):
+                names.append(line.split(":", 1)[1].split(",", 1)[0].strip())
+        return names
+
     def to_bytes(self, replacements: dict[int, str] | None = None) -> bytes:
         replacements = replacements or {}
         out = []

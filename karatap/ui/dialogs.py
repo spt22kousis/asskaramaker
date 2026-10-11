@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
 from ..audio import Player, make_metronome
 from ..settings import Settings
 from ..timing import END_KEY, END_RELEASE, INSERT_GAP, MERGE_PREV
-from .widgets import jp_font
+from .widgets import ui_font
 
 WARMUP_TAPS = 4
 
@@ -43,7 +43,7 @@ class CalibrationDialog(QDialog):
         self.info = QLabel(f"按「開始」後會播放節拍器（{settings.metronome_bpm:g} BPM）。\n"
                            f"用打軸鍵（{settings.tap_keys}）或空白鍵跟著拍子敲，前 {WARMUP_TAPS} 下不計。")
         self.stats = QLabel("—")
-        self.stats.setFont(jp_font(22))
+        self.stats.setFont(ui_font(22, bold=True))
         self.start_btn = QPushButton("開始")
         self.start_btn.clicked.connect(self.start)
         self.apply_btn = QPushButton("套用")
