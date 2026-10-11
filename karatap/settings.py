@@ -36,6 +36,7 @@ class Settings:
     tap_keys: str = "DFJK"             # each character is a tap key
     end_key: str = "L"
     metronome_bpm: float = 100.0
+    wave_mode: str = "wave"            # 'wave' or 'spec' under the line view
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Settings":

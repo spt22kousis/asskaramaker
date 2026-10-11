@@ -150,9 +150,9 @@ class SettingsDialog(QDialog):
             return
         keys = "".join(dict.fromkeys(self.tap_keys.text().upper().replace(" ", "")))
         end_key = self.end_key.text().upper()
-        reserved = set("RMSPCTE")
+        reserved = set("RMSPCTEV")
         if not keys or reserved & set(keys + end_key) or end_key in keys:
-            self.error.setText("打軸鍵不能空白，不能和結束鍵重複，也不能用 R M S P C T E（已是快捷鍵）")
+            self.error.setText("打軸鍵不能空白，不能和結束鍵重複，也不能用 R M S P C T E V（已是快捷鍵）")
             return
         s = self.settings
         s.latency_ms = self.latency.value()

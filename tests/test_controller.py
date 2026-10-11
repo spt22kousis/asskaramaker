@@ -3,7 +3,7 @@ from conftest import DATA, EXAMPLES
 import pytest
 
 from karatap.ass_doc import AssDocument
-from karatap.controller import TAPPED_OK, UNTAPPED, WARNING, Controller
+from karatap.controller import IMPORTED, TAPPED_OK, UNTAPPED, WARNING, Controller, LineResult
 from karatap.karaoke import KaraLine
 from karatap.settings import Settings
 from karatap.timing import INSERT_GAP, ONSET, TAPPED
@@ -164,6 +164,78 @@ def test_edit_split_is_saved_and_exported(tmp_path):
     assert "低|<て" not in texts[1] and "低音|<て{\\k0}#|<いおん" in texts[1]
     c2.revert_line(1)
     assert not c2.lines[1].edited
+
+
+TIMED = ("[Events]\r\n"
+         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n"
+         # real timing: 30 + 50 + 20(gap) + 100 = 200 cs = line length
+         "Comment: 0,0:00:01.00,0:00:03.00,K1,,0,0,0,karaoke,{\\k30}あ{\\k50}い{\\k20} {\\k100}う\r\n"
+         # placeholders: {\k1} x3 on a 2 s line -> not imported
+         "Comment: 0,0:00:04.00,0:00:06.00,K1,,0,0,0,karaoke,{\\k1}か{\\k1}き{\\k1}く\r\n")
+
+
+def make_timed():
+    doc = AssDocument(TIMED.encode("utf-8"))
+    c = Controller(doc, Settings())
+    return doc, c
+
+
+def test_import_existing_k():
+    doc, c = make_timed()
+    assert c.import_file_timing() == 1
+    assert c.results[0].bounds == [(1000, 1300), (1300, 1800), (2000, 3000)]
+    assert c.status(0) == IMPORTED and c.status(1) == UNTAPPED
+    assert c.export_bytes() == doc.raw            # untouched imported lines are copied as they are
+    assert c.progress_data()["lines"] == {}       # and not stored in the progress file
+
+
+def test_import_real_file_round_trips():
+    if not (EXAMPLES / "snooze_short.ass").exists():
+        pytest.skip("sample not present")
+    doc = AssDocument.load(EXAMPLES / "snooze_short.ass")
+    for timing in ("keep", "tapped"):
+        c = Controller(doc, Settings(line_timing=timing))
+        assert c.import_file_timing() == len(c.lines) == 6
+        assert c.export_bytes() == doc.raw
+
+
+def test_import_skips_lines_with_results_or_edits():
+    doc, c = make_timed()
+    c.results[0] = LineResult([(1100, 1200), (1200, 1300), (1400, 1500)])
+    c.edit_line(1, "{\\k1}かき{\\k1}く")
+    assert c.import_file_timing() == 0
+
+
+def test_drag_handles_shared_and_separate():
+    doc, c = make_timed()
+    c.import_file_timing()
+    hs = c.handles(0)
+    refs = [h.refs for h in hs]
+    # あ start | あ end = い start (shared) | い end | う start | う end | line start | line end
+    assert refs == [(("s", 0),), (("e", 0), ("s", 1)), (("e", 1),), (("s", 2),), (("e", 2),),
+                    (("L0",),), (("L1",),)]
+    shared = hs[1]
+    c.begin_drag(0)
+    assert c.move_handle(0, shared, 1404) == 1400                 # 10 ms steps
+    assert c.results[0].bounds[:2] == [(1000, 1400), (1400, 1800)]
+    assert c.move_handle(0, shared, 5000) == 1800                 # can't pass い's end
+    assert c.status(0) == TAPPED_OK                               # no longer the file's timing
+    out = AssDocument(c.export_bytes()).karaoke_events()[0].text
+    assert out == "{\\k80}あ{\\k0}い{\\k20} {\\k100}う"
+    assert c.undo_drag() == 0
+    assert c.status(0) == IMPORTED and c.export_bytes() == doc.raw
+
+
+def test_drag_line_edge_sets_override():
+    doc, c = make_timed()
+    c.import_file_timing()
+    l1 = next(h for h in c.handles(0) if h.refs == (("L1",),))
+    c.begin_drag(0)
+    c.move_handle(0, l1, 3500)
+    ev = AssDocument(c.export_bytes()).karaoke_events()[0]
+    # line now ends at 3.50; the extra time goes to the last syllable
+    assert ev.get("end") == "0:00:03.50"
+    assert ev.text == "{\\k30}あ{\\k50}い{\\k20} {\\k150}う"
 
 
 def test_progress_roundtrip(tmp_path):
