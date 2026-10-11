@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 from ..controller import Controller, LineInfo
+from ..karaoke import merge_syllables, split_points, split_syllable
 
 JP_FONTS = ["Noto Sans JP", "Yu Gothic UI", "Yu Gothic", "Meiryo", "MS Gothic", "Microsoft JhengHei"]
 
@@ -19,6 +20,7 @@ ACTIVE = QColor("#ffcc33")
 NEXT = QColor("#ffffff")
 PRESSED_BG = QColor("#3a3214")
 WARN = QColor("#ff5c5c")
+EDIT = QColor("#c58cff")
 
 
 def jp_font(px: float, bold: bool = True) -> QFont:
@@ -166,14 +168,46 @@ def line_units(line: LineInfo) -> list[Unit]:
     return units
 
 
+@dataclass
+class EditSpot:
+    x: float
+    row: str          # 'base' or 'ruby'
+    kind: str         # 'merge' (an existing boundary) or 'split' (a possible one)
+    syl: int
+    at: int = 0       # split: piece index inside the syllable
+
+
 class LineView(QWidget):
-    """Previous / current / next line with furigana and per-syllable state."""
+    """Previous / current / next line with furigana and per-syllable state.
+
+    While editing is enabled (playback paused), clicking between two
+    characters of the current line splits or merges syllables there.
+    """
+
+    edit_requested = Signal(int, str, int, int)     # line, 'split'/'merge', syllable, piece
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.ctrl: Controller | None = None
         self.song_ms = 0.0
+        self.edit_enabled = False
+        self._spots: list[EditSpot] = []
+        self._spot_line = -1
+        self._ruby_bottom = 0.0
+        self._hit = 0.0
         self.setMinimumHeight(250)
+
+    def mousePressEvent(self, ev) -> None:
+        if not self.edit_enabled or not self._spots or ev.button() != Qt.LeftButton:
+            return
+        pos = ev.position()
+        row = "ruby" if pos.y() < self._ruby_bottom else "base"
+        for pool in ([s for s in self._spots if s.row == row], self._spots):
+            if pool:
+                best = min(pool, key=lambda s: abs(s.x - pos.x()))
+                if abs(best.x - pos.x()) <= self._hit:
+                    self.edit_requested.emit(self._spot_line, best.kind, best.syl, best.at)
+                    return
 
     def set_controller(self, ctrl: Controller | None) -> None:
         self.ctrl = ctrl
@@ -233,7 +267,9 @@ class LineView(QWidget):
                 return DONE
             return FG if main else DIM
 
-        for u, w in zip(units, widths):
+        spots: list[EditSpot] = []
+        kara = line.kara
+        for n, (u, w) in enumerate(zip(units, widths)):
             bw = bm.horizontalAdvance(u.base)
             col = colour(u.base_syls)
             p.setFont(bf)
@@ -248,12 +284,56 @@ class LineView(QWidget):
                 rw = sum(rm.horizontalAdvance(t) for t, _ in u.ruby)
                 rx = x + (w - rw) / 2
                 p.setFont(rf)
-                for text, si in u.ruby:
+                for j, (text, si) in enumerate(u.ruby):
                     tw = rm.horizontalAdvance(text)
                     p.setPen(colour([si]))
                     p.drawText(QRectF(rx, rect.top() - rm.height(), tw, rm.height()), Qt.AlignCenter, text)
+                    if main:
+                        if j and merge_syllables(kara, u.ruby[j - 1][1]) is not None:
+                            spots.append(EditSpot(rx, "ruby", "merge", u.ruby[j - 1][1]))
+                        spots += self._split_spots(kara, si, rx, rm, "ruby")
                     rx += tw
+            elif main and len(u.base_syls) == 1:
+                spots += self._split_spots(kara, u.base_syls[0], rect.left(), bm, "base")
+            if main and n + 1 < len(units) and u.base_syls and units[n + 1].base_syls:
+                a, b = u.base_syls[-1], units[n + 1].base_syls[0]
+                if b == a + 1 and merge_syllables(kara, a) is not None:
+                    spots.append(EditSpot(x + w, "base", "merge", a))
             x += w
+
+        if main:
+            self._spots, self._spot_line = spots, li
+            self._ruby_bottom = baseline - bm.ascent()
+            self._hit = size * 0.45
+            if self.edit_enabled:
+                self._draw_spots(p, spots, baseline, bm, rm)
+
+    @staticmethod
+    def _split_spots(kara, si: int, x0: float, fm: QFontMetricsF, row: str) -> list[EditSpot]:
+        pieces = split_points(kara, si)
+        out = []
+        for k in range(1, len(pieces)):
+            if split_syllable(kara, si, k) is not None:
+                out.append(EditSpot(x0 + fm.horizontalAdvance("".join(pieces[:k])), row, "split", si, k))
+        return out
+
+    def _draw_spots(self, p: QPainter, spots: list[EditSpot], baseline: float,
+                    bm: QFontMetricsF, rm: QFontMetricsF) -> None:
+        """Existing syllable boundaries as ticks, possible split points as dots."""
+        base_top = baseline - bm.ascent()
+        for s in spots:
+            if s.row == "base":
+                y0, y1 = base_top + bm.height() * 0.15, baseline + bm.descent() * 0.6
+            else:
+                y0, y1 = base_top - rm.height() * 0.95, base_top - rm.height() * 0.1
+            if s.kind == "merge":
+                p.setPen(QPen(EDIT, 2))
+                p.drawLine(QPointF(s.x, y0), QPointF(s.x, y1))
+            else:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(EDIT).darker(140))
+                r = 2.5
+                p.drawEllipse(QPointF(s.x, y1), r, r)
 
     def _draw_progress(self, p: QPainter, li: int) -> None:
         c = self.ctrl

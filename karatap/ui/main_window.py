@@ -15,6 +15,7 @@ from ..ass_doc import AssDocument, format_time
 from ..audio import AudioError, AudioSource, Player, pick_output_device
 from ..clock import SongClock
 from ..controller import PARTIAL, TAPPED_OK, UNTAPPED, WARNING, Action, Controller
+from ..karaoke import merge_syllables, split_syllable
 from ..settings import Settings
 from ..timing import HOLD, KEEP, ONSET, TAPPED
 from .dialogs import CalibrationDialog, SettingsDialog
@@ -27,7 +28,7 @@ HELP = """打軸鍵：{taps}（可多鍵交替／雙押）　結束鍵：{end}
 空白：播放／暫停　←／→：倒退／前進 2 秒
 R：重敲本行　Backspace：復原上一下　↑／↓：上一行／下一行　Ctrl+G：跳到第幾行
 M：長按／起點模式　S：切換速度　P：保持音高　C：逐行／連續　T：行時間模式
-E：延長選取行的行時間（敲出界時）
+E：延長選取行的行時間（敲出界時）　暫停時點目前那行字與字之間：切開／合併音節（紫線＝現有分界，點＝可切開處）
 Ctrl+S：存進度　Ctrl+E：匯出新 ASS　Ctrl+L：延遲校正　Ctrl+,：設定"""
 
 
@@ -81,10 +82,12 @@ class MainWindow(QMainWindow):
         self.help = QLabel()
         self.help.setFont(jp_font(12, bold=False))
         self.help.setStyleSheet("color: #8a8f99")
+        self.help.setWordWrap(True)
         self.list = QListWidget()
         self.list.setFont(jp_font(14, bold=False))
         self.list.setFocusPolicy(Qt.NoFocus)
         self.list.itemDoubleClicked.connect(lambda it: self.jump(self.list.row(it)))
+        self.view.edit_requested.connect(self.edit_syllables)
 
         right = QWidget()
         lay = QVBoxLayout(right)
@@ -135,6 +138,7 @@ class MainWindow(QMainWindow):
         act(m, "跳到第幾行…", self.ask_jump, "Ctrl+G")
         act(m, "延長選取行的行時間 (E)", lambda: self.extend_line(self.list.currentRow()))
         act(m, "清除選取行的打軸結果", self.clear_selected)
+        act(m, "還原目前這行的音節切分", self.revert_split)
         m = self.menuBar().addMenu("工具")
         act(m, "延遲校正…", self.calibrate, "Ctrl+L")
         act(m, "設定…", self.open_settings, "Ctrl+,")
@@ -471,6 +475,41 @@ class MainWindow(QMainWindow):
         self._refresh_list()
         self._autosave(force=True)
 
+    def _confirm_clear(self, li: int) -> bool:
+        if li not in self.ctrl.results:
+            return True
+        return QMessageBox.question(
+            self, "改變音節切分",
+            f"第 {li + 1} 行已經打好了，改變切分會清掉這行的打軸結果。要繼續嗎？") == QMessageBox.Yes
+
+    def edit_syllables(self, li: int, kind: str, syl: int, at: int) -> None:
+        if not self.ctrl or (self.player and self.player.playing):
+            return
+        kara = self.ctrl.lines[li].kara
+        new = split_syllable(kara, syl, at) if kind == "split" else merge_syllables(kara, syl)
+        if new is None:
+            self.statusBar().showMessage("這裡不能合併（振假名和一般文字不能放在同一個音節）", 3000)
+            return
+        if not self._confirm_clear(li):
+            return
+        self.ctrl.edit_line(li, new)
+        self._last_statuses = []
+        self._refresh_list()
+        self._autosave(force=True)
+
+    def revert_split(self) -> None:
+        if not self.ctrl:
+            return
+        li = self.ctrl.current_line()
+        if not self.ctrl.lines[li].edited:
+            self.statusBar().showMessage("這行的音節切分沒有改過", 2000)
+            return
+        if self._confirm_clear(li):
+            self.ctrl.revert_line(li)
+            self._last_statuses = []
+            self._refresh_list()
+            self._autosave(force=True)
+
     def clear_selected(self) -> None:
         li = self.list.currentRow()
         if self.ctrl and li >= 0:
@@ -566,8 +605,8 @@ class MainWindow(QMainWindow):
         for i, (line, st) in enumerate(zip(self.ctrl.lines, statuses)):
             if i < len(self._last_statuses) and self._last_statuses[i] == st:
                 continue
-            plain = "".join(f.base for f, s in zip(line.furi, line.kara.syls)
-                            if not f.continuation and not s.is_gap)
+            plain = "".join(s.text if s.is_gap else f.base
+                            for f, s in zip(line.furi, line.kara.syls) if not f.continuation)
             it = self.list.item(i)
             it.setText(f"{i + 1:>3} {STATUS_ICON[st]} {format_time(line.event.start_ms)}  {plain}")
             it.setForeground(QColor(STATUS_COLOR[st]))
@@ -604,6 +643,7 @@ class MainWindow(QMainWindow):
             msg = ""
         items = [cue_item(c.lines[li], si) for li, si in up]
         self.cue.set_state(items, pressed, msg)
+        self.view.edit_enabled = not playing
         self.view.set_time(song)
         cur = c.current_line()
         if self.list.currentRow() != cur and not self.list.underMouse():

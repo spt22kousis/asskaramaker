@@ -1,4 +1,5 @@
-from karatap.karaoke import KaraLine, furigana_for, split_furigana
+from karatap.karaoke import (KaraLine, atoms, furigana_for, merge_syllables, split_furigana,
+                             split_syllable)
 
 SNOOZE = "{\\-A}{\\k18}排|<は{\\k18}#|<い{\\k22}気|<き{\\k21}に{\\k15}酔|<よ{\\k17}っ"
 SPACES = "{\\-A}{\\k19}あ{\\k39}の {\\k28}話|<は{\\k18}#|<な{\\k18}#|<し{\\k2} {\\k56}は"
@@ -54,6 +55,41 @@ def test_k_inside_mixed_block_and_non_k_tags():
     k = KaraLine.parse("{\\an8\\k10\\-B}a{\\kt5\\k20}b")
     assert [(s.value, s.text) for s in k.syls] == [(10, "a"), (20, "b")]
     assert k.rebuild([11, 22]) == "{\\an8\\k11\\-B}a{\\kt5\\k22}b"
+
+
+def test_atoms():
+    assert atoms("しん") == ["し", "ん"]
+    assert atoms("きゅー") == ["きゅ", "ー"]          # small kana join, ー is its own
+    assert atoms("じっく！") == ["じ", "っ", "く！"]   # trailing punctuation joins the previous
+    assert atoms("「♡」") == ["「♡」"]
+    assert atoms('"MIRAI"') == ['"MIRAI"']            # English word stays whole
+    assert atoms("Don't") == ["Don't"]
+    assert atoms("の「あ") == ["の", "「あ"]           # opening bracket joins the next
+    assert atoms("39") == ["3", "9"]
+    for t in ("しん", "じっく！", "の「あ", "Wa・", " の "):
+        assert "".join(atoms(t)) == t
+
+
+def test_split_and_merge_round_trip():
+    line = "{\\k1}新|<しん{\\k1}作|<さく{\\k1}みゅー{\\k1}だ"
+    k = KaraLine.parse(line)
+    s1 = split_syllable(k, 0, 1)
+    assert s1 == "{\\k1}新|<し{\\k0}#|<ん{\\k1}作|<さく{\\k1}みゅー{\\k1}だ"
+    assert merge_syllables(KaraLine.parse(s1), 0) == line
+    s2 = split_syllable(k, 2, 1)
+    assert s2 == "{\\k1}新|<しん{\\k1}作|<さく{\\k1}みゅ{\\k0}ー{\\k1}だ"
+    assert merge_syllables(KaraLine.parse(s2), 2) == line
+    # two kanji into one group
+    assert merge_syllables(k, 0) == "{\\k2}新作|<しんさく{\\k1}みゅー{\\k1}だ"
+
+
+def test_merge_and_split_refusals():
+    k = KaraLine.parse("{\\k1}呼|<よ{\\k1}ん{\\k1} {\\k1}で{\\-A}{\\k1}ね{\\k1}Night!")
+    assert merge_syllables(k, 0) is None          # ruby + plain text
+    assert merge_syllables(k, 1) is None          # across a space
+    assert merge_syllables(k, 3) is None          # extra tag in the next syllable
+    assert split_syllable(k, 5, 1) is None        # English word has no split point
+    assert split_syllable(k, 1, 1) is None        # single character
 
 
 def test_furigana():

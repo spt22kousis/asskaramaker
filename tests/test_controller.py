@@ -139,6 +139,33 @@ def test_tapped_line_timing_writes_times():
     assert sum(s.value for s in k.syls) == 240
 
 
+def test_edit_split_is_saved_and_exported(tmp_path):
+    from karatap.karaoke import split_syllable
+    p = tmp_path / "x.karatap.json"
+    doc, c = make(progress=p)
+    tap_hold(c, "F", 1200, 1900); tap_hold(c, "J", 2000, 2600); tap_hold(c, "F", 2600, 3300)
+    # line 1 (untapped): split 低音|<ていおん's reading after the first beat
+    k = c.lines[1].kara
+    si = next(i for i, s in enumerate(k.syls) if s.text.startswith("低音"))
+    new = split_syllable(k, si, 1)
+    assert c.edit_line(1, new) is False          # nothing to clear
+    assert c.lines[1].edited and c.current_line() == 1
+    # line 0 (tapped): editing clears its taps
+    k0 = c.lines[0].kara
+    assert c.edit_line(0, split_syllable(k0, 0, 1)) is True and 0 not in c.results
+    c.save_progress()
+
+    doc2, c2 = make(progress=p)
+    c2.load_progress()
+    assert c2.lines[1].kara.text == new and c2.lines[0].edited
+    out = AssDocument(c2.export_bytes())
+    texts = [e.text for e in out.karaoke_events()]
+    assert texts[1] == new                        # untapped but edited: new split is written
+    assert "低|<て" not in texts[1] and "低音|<て{\\k0}#|<いおん" in texts[1]
+    c2.revert_line(1)
+    assert not c2.lines[1].edited
+
+
 def test_progress_roundtrip(tmp_path):
     p = tmp_path / "x.karatap.json"
     doc, c = make(progress=p)

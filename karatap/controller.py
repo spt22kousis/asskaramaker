@@ -39,6 +39,16 @@ class LineInfo:
     def gaps(self) -> list[bool]:
         return [s.is_gap for s in self.kara.syls]
 
+    @property
+    def edited(self) -> bool:
+        """Syllable split changed in the tool (export writes the new text)."""
+        return self.kara.text != self.event.text
+
+
+def make_line(idx: int, event: Event, text: str) -> LineInfo:
+    k = KaraLine.parse(text)
+    return LineInfo(idx, event, k, furigana_for(k), k.tappable())
+
 
 @dataclass
 class LineResult:
@@ -83,10 +93,9 @@ class Controller:
         evs = sorted(doc.karaoke_events(), key=lambda e: (e.start_ms, e.line_no))
         self.lines: list[LineInfo] = []
         for e in evs:
-            k = KaraLine.parse(e.text)
-            taps = k.tappable()
-            if taps:
-                self.lines.append(LineInfo(len(self.lines), e, k, furigana_for(k), taps))
+            line = make_line(len(self.lines), e, e.text)
+            if line.taps:
+                self.lines.append(line)
         self.results: dict[int, LineResult] = {}
         self.cursor = 0
         self.take: Take | None = None
@@ -148,6 +157,22 @@ class Controller:
     def clear_line(self, li: int) -> None:
         if self.results.pop(li, None) is not None:
             self.dirty = True
+
+    def edit_line(self, li: int, text: str) -> bool:
+        """Replace line li's karaoke text (new syllable split). Returns True if its taps were cleared."""
+        line = self.lines[li]
+        new = make_line(li, line.event, text)
+        if not new.taps:
+            raise ValueError("a line needs at least one syllable to tap")
+        self.lines[li] = new
+        cleared = self.results.pop(li, None) is not None
+        self.start_take(li)
+        self.dirty = True
+        return cleared
+
+    def revert_line(self, li: int) -> bool:
+        """Back to the syllable split from the ASS file."""
+        return self.edit_line(li, self.lines[li].event.text)
 
     # -- takes -------------------------------------------------------------------
     def start_take(self, li: int) -> None:
@@ -313,9 +338,11 @@ class Controller:
         repl: dict[int, str] = {}
         for li, line in enumerate(self.lines):
             timing = self.timing_for(li)
-            if timing is None:
-                continue
             ev = line.event
+            if timing is None:
+                if line.edited:       # untapped, but its syllable split was changed
+                    repl[ev.line_no] = ev.with_fields(text=line.kara.text).render()
+                continue
             changes = {"text": line.kara.rebuild(timing.values, timing.inserts)}
             r = self.results[li]
             if (self.settings.line_timing == TAPPED or r.start_override is not None
@@ -345,6 +372,10 @@ class Controller:
                 }
                 for li, r in sorted(self.results.items())
             },
+            "edits": {
+                l.key: {"text": l.event.text, "edited": l.kara.text}
+                for l in self.lines if l.edited
+            },
         }
 
     def save_progress(self) -> None:
@@ -364,12 +395,24 @@ class Controller:
         by_text: dict[str, list[LineInfo]] = {}
         for l in self.lines:
             by_text.setdefault(l.event.text, []).append(l)
-        dropped = 0
-        for key, rec in data.get("lines", {}).items():
+
+        def find(key: str, text: str) -> LineInfo | None:
             line = by_key.get(key)
-            if line is None or line.event.text != rec["text"]:
-                cands = by_text.get(rec["text"], [])
+            if line is None or line.event.text != text:
+                cands = by_text.get(text, [])
                 line = cands[0] if len(cands) == 1 else None
+            return line
+
+        dropped = 0
+        for key, rec in data.get("edits", {}).items():     # syllable splits first: taps depend on them
+            line = find(key, rec["text"])
+            if line is None:
+                dropped += 1
+                continue
+            self.lines[line.idx] = make_line(line.idx, line.event, rec["edited"])
+        for key, rec in data.get("lines", {}).items():
+            line = find(key, rec["text"])
+            line = self.lines[line.idx] if line else None
             if line is None or len(rec["bounds"]) != len(line.taps):
                 dropped += 1
                 continue
