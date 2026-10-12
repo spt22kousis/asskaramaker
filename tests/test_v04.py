@@ -228,3 +228,68 @@ def test_failed_split_edit_leaves_no_undo_step(tmp_path):
     with pytest.raises(ValueError):
         c.edit_line(0, "{\\k1}！")
     assert c.undo_stack == []
+
+
+def test_merging_the_last_line_leaves_no_undo_step(tmp_path):
+    import pytest
+    doc, c = project(tmp_path)
+    with pytest.raises(ValueError):
+        c.merge_with_next(len(c.lines) - 1)
+    assert c.undo_stack == []
+
+
+def test_unmark_after_deleting_a_marked_line(tmp_path):
+    doc, c = project(tmp_path)
+    tap_syllables(c, 0, 10000)
+    tap_syllables(c, 1, 12000)
+    c.toggle_mark(0, c.lines[0].taps[0])
+    c.toggle_mark(1, c.lines[1].taps[0])
+    c.delete_line(1)
+    assert c.unmark_last() == (0, c.lines[0].taps[0])     # the deleted line's mark is skipped
+    assert c.unmark_last() is None
+    c.undo_edit()                                          # the deleted line comes back with its mark
+    assert c.marked(1) == {c.lines[1].taps[0]}
+
+
+def test_backspace_still_unmarks_after_undo_and_reopening(tmp_path):
+    doc, c = project(tmp_path)
+    tap_syllables(c, 0, 10000)
+    t0 = c.lines[0].taps
+    c.toggle_mark(0, t0[0])
+    c.toggle_mark(0, t0[1])
+    c.insert_line(2, "{\\k1}さ")
+    c.undo_edit()
+    assert c.unmark_last() == (0, t0[1])
+    c.save_progress()
+    c2 = Controller(doc, Settings(), c.progress_path)
+    c2.load_progress()
+    assert c2.unmark_last() == (0, t0[0])
+
+
+def test_inserting_several_lines_is_one_undo_step(tmp_path):
+    doc, c = project(tmp_path)
+    assert c.insert_lines(0, ["{\\k1}さ", "{\\k1}し"]) == 1
+    assert [l.plain for l in c.lines] == ["あい", "さ", "し", "うえお", "か"]
+    assert c.undo_edit() == "插入行" and len(c.lines) == 3
+
+
+def test_a_damaged_backup_changes_nothing(tmp_path):
+    import pytest
+    doc, c = project(tmp_path)
+    tap_line(c, 0, 10000, 12000)
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"line_taps": {"0": {"span": [1, 2]}}}), encoding="utf-8")   # no "text"
+    with pytest.raises(ValueError):
+        c.restore_backup(bad)
+    assert c.line_taps == {0: (10000, 12000)} and c.undo_label() == "打行軸 第 1 行"
+
+
+def test_layout_fixed_gives_the_same_times(tmp_path):
+    doc, c = project(tmp_path)
+    tap_line(c, 0, 10000, 12000)
+    tap_line(c, 1, 12500, 14000)
+    tap_syllables(c, 0, 10000)
+    plain = ([c.line_start(i) for i in range(3)], c.export_bytes())
+    with c.layout_fixed():
+        assert ([c.line_start(i) for i in range(3)], c.export_bytes()) == plain
+    assert c._placements is None

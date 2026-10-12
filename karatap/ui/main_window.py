@@ -289,8 +289,10 @@ class MainWindow(QMainWindow):
             return
         try:
             ctrl.load_progress()
-        except (OSError, ValueError, KeyError) as e:
-            QMessageBox.warning(self, "進度檔", f"讀取進度失敗，從頭開始：{e}")
+        except Exception as e:          # a damaged progress file must not keep the project from opening
+            ctrl.restore({})            # really from scratch, not half loaded
+            QMessageBox.warning(self, "進度檔", f"讀取進度失敗，從頭開始：{e!r}\n"
+                                "原本的進度檔已經備份，修好後可以用「檔案 → 從備份還原」。")
         imported = ctrl.import_file_timing()
         try:
             ctrl.backup_now()           # the progress as found, before this session changes it
@@ -843,7 +845,11 @@ class MainWindow(QMainWindow):
                                         labels, 0, False)
         if not ok:
             return
-        self.ctrl.restore_backup(backups[labels.index(item)][0])
+        try:
+            self.ctrl.restore_backup(backups[labels.index(item)][0])
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "從備份還原", f"這個備份讀不了，沒有變更：{e}")
+            return
         self._after_structure(self.ctrl.cursor)
         self.statusBar().showMessage("已從備份還原", 3000)
 
@@ -1098,9 +1104,7 @@ class MainWindow(QMainWindow):
         texts = self._ask_lyrics("在後面插入一行", f"插在第 {li + 1} 行後面。[漢字|かな] 是振假名；換行＝多插幾行。", "")
         if texts is None:
             return
-        at = li
-        for text in texts:
-            at = self.ctrl.insert_line(at, text)
+        self.ctrl.insert_lines(li, texts)
         self._after_structure(li + 1)
 
     def delete_line(self, li: int | None = None) -> None:
@@ -1163,7 +1167,7 @@ class MainWindow(QMainWindow):
         msg = f"已平移 {moved} 行（{dlg.delta:+d} ms）。"
         if untouched:
             msg += f"\n{untouched} 行還沒有打軸資料，沒有移動。"
-        msg += f"\n要復原就再平移一次 {-dlg.delta:+d} ms。"
+        msg += "\n要復原請按 Ctrl+Z。"
         QMessageBox.information(self, "時間平移", msg)
         self._after_structure(self._target_line())
 
@@ -1244,8 +1248,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "匯出", "不能覆蓋原始 ASS，請換一個檔名。")
             return
         c = self.ctrl
-        statuses = [c.status(i) for i in range(len(c.lines))]
-        out.write_bytes(c.export_bytes())
+        with c.layout_fixed():
+            statuses = [c.status(i) for i in range(len(c.lines))]
+        try:
+            out.write_bytes(c.export_bytes())
+        except OSError as e:
+            QMessageBox.critical(self, "匯出失敗", f"寫不進 {out.name}：{e}")
+            return
         done = statuses.count(TAPPED_OK) + statuses.count(WARNING)
         if c.layout_on:
             pl = c.placements()
@@ -1280,8 +1289,9 @@ class MainWindow(QMainWindow):
         if not self.ctrl:
             return
         c = self.ctrl
-        statuses = [(c.status(i), c.line_start(i) if not c.layout_on or c.sung_span(i) else None,
-                     len(c.marked(i))) for i in range(len(c.lines))]
+        with c.layout_fixed():
+            statuses = [(c.status(i), c.line_start(i) if not c.layout_on or c.sung_span(i) else None,
+                         len(c.marked(i))) for i in range(len(c.lines))]
         for i, (line, (st, start, marks)) in enumerate(zip(c.lines, statuses)):
             if i < len(self._last_statuses) and self._last_statuses[i] == (st, start, marks):
                 continue

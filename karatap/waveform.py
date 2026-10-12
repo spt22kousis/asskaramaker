@@ -36,21 +36,23 @@ def peaks(pcm: np.ndarray, sr: int, t0_ms: float, t1_ms: float, width: int) -> t
 ENVELOPE_MS = 5.0
 
 
-def envelope(pcm: np.ndarray, sr: int, bin_ms: float = ENVELOPE_MS) -> tuple[np.ndarray, np.ndarray]:
-    """(min, max) of the whole song per `bin_ms` bin, computed once for the song timeline."""
+def envelope(pcm: np.ndarray, sr: int, bin_ms: float = ENVELOPE_MS) -> tuple[np.ndarray, np.ndarray, float]:
+    """(min, max) of the whole song per bin of about `bin_ms`, computed once for the song timeline,
+    and the bin's exact length in ms (a whole number of samples)."""
     mono = pcm.astype(np.float32).mean(axis=1) if pcm.ndim == 2 else pcm.astype(np.float32)
     n = max(1, int(round(sr * bin_ms / 1000)))
+    exact = n / sr * 1000.0
     bins = len(mono) // n
     if bins == 0:
-        return np.zeros(0, np.float32), np.zeros(0, np.float32)
+        return np.zeros(0, np.float32), np.zeros(0, np.float32), exact
     x = mono[:bins * n].reshape(bins, n) / 32768.0
-    return x.min(axis=1), x.max(axis=1)
+    return x.min(axis=1), x.max(axis=1), exact
 
 
-def envelope_peaks(env: tuple[np.ndarray, np.ndarray], t0_ms: float, t1_ms: float, width: int,
-                   bin_ms: float = ENVELOPE_MS) -> tuple[np.ndarray, np.ndarray]:
+def envelope_peaks(env: tuple[np.ndarray, np.ndarray, float], t0_ms: float, t1_ms: float,
+                   width: int) -> tuple[np.ndarray, np.ndarray]:
     """Per-pixel (min, max) for [t0, t1] from an envelope (zeros outside the song)."""
-    lo_env, hi_env = env
+    lo_env, hi_env, bin_ms = env
     mins = np.zeros(max(width, 0), np.float32)
     maxs = np.zeros(max(width, 0), np.float32)
     if width <= 0 or len(lo_env) == 0:

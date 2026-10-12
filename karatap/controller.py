@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -194,6 +195,7 @@ class Controller:
         self.backup_root: Path | None = default_backup_root()
         self._last_backup = -math.inf
         self.review_ms: float | None = None      # review playback: song time being watched
+        self._placements: list[Placement | None] | None = None    # set inside layout_fixed()
         self._reset()
 
     def _reset(self) -> None:
@@ -226,14 +228,14 @@ class Controller:
         self.skip_import: set[str] = set()
 
     # -- undo / redo ---------------------------------------------------------------
-    def checkpoint(self, label: str, merge: str | None = None) -> None:
-        """Remember the state before an edit so it can be undone."""
+    def checkpoint(self, label: str, merge: str | None = None, data: dict | None = None) -> None:
+        """Remember the state before an edit (`data`, default: now) so it can be undone."""
         now = time.monotonic()
         top = self.undo_stack[-1] if self.undo_stack else None
         if merge and top and top.merge == merge and now - top.at < MERGE_WINDOW_S:
             top.at = now
         else:
-            self.undo_stack.append(Checkpoint(label, self.progress_data(), merge, now))
+            self.undo_stack.append(Checkpoint(label, self.progress_data() if data is None else data, merge, now))
             del self.undo_stack[:-UNDO_LIMIT]
         self.redo_stack.clear()
 
@@ -267,7 +269,9 @@ class Controller:
 
     def _restore_keeping_marks(self, data: dict) -> None:
         marks = {k: sorted(v) for k, v in self.marks.items() if v}
+        order = list(self._mark_order)
         self.restore(dict(data, marks=marks))
+        self._mark_order = [(k, si) for k, si in order if si in self.marks.get(k, ())]
 
     def restore(self, data: dict) -> None:
         """Replace all editable state with a saved one (progress_data's format)."""
@@ -333,7 +337,21 @@ class Controller:
         return None
 
     def placements(self) -> list[Placement | None]:
+        if self._placements is not None:
+            return self._placements
         return place([self.sung_span(i) for i in range(len(self.lines))], self.layout_params)
+
+    @contextmanager
+    def layout_fixed(self):
+        """Work out the layout once for a block that only reads (per-line loops would redo it per call)."""
+        if self._placements is not None or not self.layout_on:
+            yield
+            return
+        self._placements = self.placements()
+        try:
+            yield
+        finally:
+            self._placements = None
 
     def _layout_span(self, li: int) -> tuple[float, float]:
         pl = self.placements()
@@ -547,11 +565,15 @@ class Controller:
 
     def insert_line(self, after: int, text: str) -> int:
         """Add a line after line `after` (-1: at the top). Returns its index."""
+        return self.insert_lines(after, [text])
+
+    def insert_lines(self, after: int, texts: list[str]) -> int:
+        """Add lines after line `after` (-1: at the top), one undo step. Returns the first one's index."""
         like = self.lines[max(0, after)].event
-        new = self._added_line(like, text)
+        new = [self._added_line(like, text) for text in texts]
         self.checkpoint("插入行")
         items = [self._snapshot(i) for i in range(len(self.lines))]
-        items.insert(after + 1, (new, None, None, None))
+        items[after + 1:after + 1] = [(line, None, None, None) for line in new]
         self._restructure(items, after + 1)
         return after + 1
 
@@ -594,9 +616,9 @@ class Controller:
         text_a, text_b = line.kara.text[:pos], line.kara.text[pos:]
         ev_a = line.event.with_fields(text=text_a) if line.added else line.event
         a = make_line(li, ev_a, text_a, line.added_key)
-        b = self._added_line(line.event, text_b)
         if not a.taps:
             raise ValueError("a line needs at least one syllable to tap")
+        b = self._added_line(line.event, text_b)
         self.checkpoint("拆開行")
         n = len(a.taps)
         r, tap = self.results.get(li), self.line_taps.get(li)
@@ -616,7 +638,8 @@ class Controller:
 
     def merge_with_next(self, li: int) -> None:
         """Join line li and the next one, a space syllable between them."""
-        self.checkpoint("合併行")
+        if not 0 <= li < len(self.lines) - 1:
+            raise ValueError("no next line to merge with")
         a, b = self.lines[li], self.lines[li + 1]
         edge_space = a.kara.syls[-1].text.endswith(" ") or b.kara.text.startswith(" ") \
             or (b.kara.syls and b.kara.syls[0].text.startswith(" ") and not b.kara.prefix)
@@ -628,6 +651,7 @@ class Controller:
         result = LineResult(list(ra.bounds) + list(rb.bounds)) if ra and rb else None
         sa, sb = self._own_span(li), self._own_span(li + 1)
         span = (sa[0], sb[1]) if sa and sb else (sa or sb)
+        self.checkpoint("合併行")
         items = [self._snapshot(i) for i in range(len(self.lines))]
         items[li:li + 2] = [(merged, result, span, None)]
         self._forget(b)
@@ -961,8 +985,11 @@ class Controller:
         """Remove the newest mark still there. Returns (line, syllable)."""
         while self._mark_order:
             key, si = self._mark_order.pop()
-            if si in self.marks.get(key, ()):
-                li = next(l.idx for l in self.lines if l.key == key)
+            if si not in self.marks.get(key, ()):
+                continue
+            # Marks of a deleted line (or of syllables split off) stay for undo but can't be shown.
+            li = next((l.idx for l in self.lines if l.key == key), None)
+            if li is not None and si in self.lines[li].taps:
                 self.toggle_mark(li, si)
                 return li, si
         return None
@@ -983,6 +1010,10 @@ class Controller:
     # -- pre-export check ----------------------------------------------------------------
     def check(self) -> list[Issue]:
         """Things worth a look before exporting, errors first."""
+        with self.layout_fixed():
+            return self._check()
+
+    def _check(self) -> list[Issue]:
         out: list[Issue] = []
         n = len(self.lines)
         spans = [self.sung_span(i) for i in range(n)]
@@ -1165,6 +1196,10 @@ class Controller:
         return None if text == original else text
 
     def export_bytes(self) -> bytes:
+        with self.layout_fixed():
+            return self._export_bytes()
+
+    def _export_bytes(self) -> bytes:
         repl: dict[int, str | None] = {int(key): None for key in self.deleted}
         after: dict[int, list[str]] = {}
         before: dict[int, list[str]] = {}
@@ -1275,9 +1310,17 @@ class Controller:
         return out
 
     def restore_backup(self, path: Path) -> None:
+        """Load a backup (one undo step). A damaged one raises ValueError and changes nothing."""
         data = json.loads(path.read_text(encoding="utf-8"))
-        self.checkpoint("從備份還原")
-        self.restore(data)
+        before = self.progress_data()
+        order = list(self._mark_order)
+        try:
+            self.restore(data)
+        except Exception as e:      # whatever a damaged file trips over
+            self.restore(before)
+            self._mark_order = order
+            raise ValueError(f"備份檔的內容不完整：{e!r}") from e
+        self.checkpoint("從備份還原", data=before)
 
     def load_progress(self) -> None:
         self.load_messages = []
@@ -1366,6 +1409,7 @@ class Controller:
                     self.layout_overrides[line.idx] = (rec.get("start"), rec.get("end"))
         keys = {l.key for l in self.lines}
         self.marks = {k: set(v) for k, v in data.get("marks", {}).items() if k in keys and v}
+        self._mark_order = [(k, si) for k, v in self.marks.items() for si in sorted(v)]
         self.skip_import = set(data.get("skip_import", []))
         self.cursor = min(max(0, int(data.get("cursor", 0))), max(0, len(self.lines) - 1))
         self.line_cursor = min(max(0, int(data.get("line_cursor", 0))), max(0, len(self.lines) - 1))

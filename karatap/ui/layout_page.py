@@ -135,6 +135,10 @@ class LayoutPage(QWidget):
         c = self.ctrl
         if not c:
             return
+        with c.layout_fixed():
+            self._refresh(c)
+
+    def _refresh(self, c: Controller) -> None:
         two = c.layout_params.rows == 2
         for w in (self.rows, self.odd, self.even, self.single, self.one, self.gap, self.lead, self.slot,
                   self.tail):

@@ -16,13 +16,17 @@ MIN_GAP_MS = 50.0
 CHUNK = 4096                 # frames per FFT batch (bounded memory)
 
 
-def onset_strength(pcm: np.ndarray, sr: int) -> tuple[np.ndarray, float]:
-    """Flux per frame and the time of frame 0 in ms (frames are HOP_MS apart)."""
+def onset_strength(pcm: np.ndarray, sr: int) -> tuple[np.ndarray, float, float]:
+    """Flux per frame, the time of frame 0 and the frame step, in ms.
+
+    The step is a whole number of samples, so only about HOP_MS (4.99 ms at 44.1 kHz).
+    """
     mono = pcm.astype(np.float32).mean(axis=1) if pcm.ndim == 2 else pcm.astype(np.float32)
     mono /= 32768.0
     hop = max(1, int(round(sr * HOP_MS / 1000)))
+    hop_ms = hop / sr * 1000.0
     if len(mono) < N_FFT + hop:
-        return np.zeros(0, dtype=np.float32), 0.0
+        return np.zeros(0, dtype=np.float32), 0.0, hop_ms
     n_frames = 1 + (len(mono) - N_FFT) // hop
     freqs = np.fft.rfftfreq(N_FFT, 1 / sr)
     band = (freqs >= FMIN) & (freqs <= FMAX)
@@ -40,7 +44,7 @@ def onset_strength(pcm: np.ndarray, sr: int) -> tuple[np.ndarray, float]:
         else:
             flux[a + 1:a + CHUNK] = np.maximum(np.diff(logspec, axis=0), 0).sum(axis=1)
         prev = logspec[-1]
-    return flux, (N_FFT / 2) / sr * 1000.0
+    return flux, (N_FFT / 2) / sr * 1000.0, hop_ms
 
 
 def pick_onsets(flux: np.ndarray, t0_ms: float, hop_ms: float = HOP_MS) -> np.ndarray:
@@ -64,8 +68,8 @@ def pick_onsets(flux: np.ndarray, t0_ms: float, hop_ms: float = HOP_MS) -> np.nd
 
 
 def detect(pcm: np.ndarray, sr: int) -> np.ndarray:
-    flux, t0 = onset_strength(pcm, sr)
-    return pick_onsets(flux, t0)
+    flux, t0, hop_ms = onset_strength(pcm, sr)
+    return pick_onsets(flux, t0, hop_ms)
 
 
 def snap(ms: float, onsets: np.ndarray | None, tolerance_ms: float) -> float:
