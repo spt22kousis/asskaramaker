@@ -20,6 +20,7 @@ from pathlib import Path
 from .ass_doc import AssDocument, Event, format_time
 from .karaoke import Furi, KaraLine, furigana_for
 from .layout import LayoutParams, Placement, place
+from .project import is_ruby_style, is_template_line, template_styles
 from .settings import Settings
 from .timing import KEEP, TAPPED, LineTiming, TapMachine, TimingOptions, compute_line, to_cs
 
@@ -1110,8 +1111,30 @@ class Controller:
             if self.marked(li):
                 out.append(Issue(li, "warn", f"有 {len(self.marked(li))} 個回放時做的標記還沒處理",
                                  min(self.marked(li))))
+        out += self._template_issues(pl)
         rank = {"error": 0, "warn": 1, "info": 2}
         return sorted(out, key=lambda i: (rank[i.level], i.line))
+
+    def _template_issues(self, pl) -> list[Issue]:
+        """Lines whose style no template applies to: Apply Karaoke Template leaves them as they are.
+        A file without any template lines is asked about on export instead."""
+        if not any(is_template_line(e) for e in self.doc.events):
+            return []
+        covered, every = template_styles(self.doc)
+        if every:
+            return []
+        by_style: dict[str, list[int]] = {}
+        for li, line in enumerate(self.lines):
+            style = pl[li].style if pl[li] else line.event.style
+            if style not in covered:
+                by_style.setdefault(style, []).append(li)
+        fix = "請在「③ 版面與輸出」換樣式" if self.layout_on else "請開啟版面並選樣式，或匯出後在 Aegisub 換樣式"
+        out = []
+        for style, lis in by_style.items():
+            why = "（-furigana 是振假名用的樣式）" if is_ruby_style(style) else ""
+            out.append(Issue(lis[0], "warn", f"樣式「{style}」沒有 template 行{why}，這個樣式的 {len(lis)} 行"
+                                             f"套樣板不會有效果；{fix}", page="layout"))
+        return out
 
     # -- line tapping (whole lines, before the syllables) ---------------------------------
     def start_line_take(self, li: int) -> None:

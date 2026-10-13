@@ -44,11 +44,45 @@ def media_ref(media: Path, ass_path: Path) -> str:
         return str(media)
 
 
-def pick_style(names: list[str], preferred: tuple[str, ...]) -> str:
-    for p in preferred:
+def is_ruby_style(name: str) -> bool:
+    """karaskel's furigana styles ("<style>-furigana"): for the ruby only, never a lyric line's style."""
+    return "furigana" in name          # karaskel's own test
+
+
+def lyric_styles(names: list[str]) -> list[str]:
+    return [n for n in names if not is_ruby_style(n)] or list(names)
+
+
+def template_styles(doc: AssDocument) -> tuple[list[str], bool]:
+    """The styles the karaoke templates apply to, in file order, and whether one applies to every style.
+
+    The templater runs a `template` line only on lines of its own style, unless it has the `all` modifier."""
+    styles, every = [], False
+    for ev in doc.events:
+        words = ev.effect.strip().lower().split()
+        if ev.kind.lower() != "comment" or not words or words[0] != "template":
+            continue
+        if "all" in words[1:]:
+            every = True
+        elif ev.style not in styles:
+            styles.append(ev.style)
+    return styles, every
+
+
+def pick_style(names: list[str], preferred: tuple[str, ...], fallback: tuple[str, ...] = ()) -> str:
+    """The first preferred style there is, then the first fallback, then the first style; never a furigana one."""
+    names = lyric_styles(names)
+    for p in (*preferred, *fallback):
         if p in names:
             return p
     return names[0] if names else "Default"
+
+
+def default_styles(doc: AssDocument) -> tuple[str, str, str]:
+    """(odd, even, single) for a new project: the usual names, else the styles that have templates."""
+    names, fallback = doc.style_names(), tuple(template_styles(doc)[0])
+    odd = pick_style(names, ODD_STYLES, fallback)
+    return odd, pick_style(names, EVEN_STYLES + (odd,)), pick_style(names, SINGLE_STYLES + (odd,))
 
 
 def karaoke_event(fmt: list[str], style: str, text: str) -> str:
@@ -66,8 +100,9 @@ def _pop_blanks(out: list[str]) -> int:
     return n
 
 
-def new_project_bytes(template: AssDocument, media: Path, ass_path: Path, texts: list[str]) -> bytes:
-    style = pick_style(template.style_names(), ODD_STYLES + SINGLE_STYLES)
+def new_project_bytes(template: AssDocument, media: Path, ass_path: Path, texts: list[str],
+                      style: str | None = None) -> bytes:
+    style = style or default_styles(template)[0]
     eols = Counter(e for e in template.eols if e)
     eol = eols.most_common(1)[0][0] if eols else "\r\n"
     drop = {e.line_no for e in template.events if not is_template_line(e)}

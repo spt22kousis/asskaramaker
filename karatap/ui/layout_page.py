@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleS
 
 from ..ass_doc import format_time, parse_time
 from ..controller import Controller
+from ..project import lyric_styles
 from .widgets import ui_font
 
 COLUMNS = ["行", "樣式", "出現", "消失", "開唱", "歌詞"]
@@ -98,13 +99,13 @@ class LayoutPage(QWidget):
         if ctrl is None:
             return
         self._loading = True
-        styles = ctrl.doc.style_names()
+        styles = lyric_styles(ctrl.doc.style_names())
         p = ctrl.layout_params
         self.rows.setCurrentIndex(self.rows.findData(p.rows) if self.rows.findData(p.rows) >= 0 else 0)
         for combo, value in ((self.odd, p.odd_style), (self.even, p.even_style), (self.single, p.single_style),
                              (self.one, p.one_style)):
             combo.clear()
-            combo.addItems(styles if value in styles else styles + [value])
+            combo.addItems(styles if value in styles else styles + [value])     # a furigana one picked before stays
             combo.setCurrentText(value)
         self.gap.setValue(p.segment_gap_ms / 1000)
         self.lead.setValue(p.lead_ms / 1000)

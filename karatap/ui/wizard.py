@@ -5,7 +5,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, Signal
-from PySide6.QtWidgets import (QApplication, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
+from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
                                QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit,
                                QPushButton, QStackedWidget, QVBoxLayout, QWidget)
 
@@ -13,8 +13,8 @@ from ..ass_doc import AssDocument
 from ..controller import Controller, progress_path_for
 from ..lyrics import (LLM_READINGS_PROMPT, LyricLine, fetch_url, has_taps, make_line, parse_any,
                       parse_text, plain_text, to_editor_text, to_kara_text)
-from ..project import (EVEN_STYLES, ODD_STYLES, SINGLE_STYLES, default_template, is_template_line,
-                       new_project_bytes, pick_style)
+from ..project import (default_styles, default_template, is_template_line, lyric_styles, new_project_bytes,
+                       template_styles)
 from ..settings import Settings
 from .lyrics_view import LyricsView, counts, option_label
 from .widgets import ui_font
@@ -79,6 +79,13 @@ class NewProjectDialog(QDialog):
         self.template_edit.setPlaceholderText("空白＝內建預設樣板")
         self.out_edit = QLineEdit()
         self.template_info = _hint("")
+        self.odd_combo, self.even_combo, self.single_combo = QComboBox(), QComboBox(), QComboBox()
+        self.style_info = _hint("")
+        styles_row = QHBoxLayout()
+        for text, combo in (("奇數行", self.odd_combo), ("偶數行", self.even_combo), ("單行", self.single_combo)):
+            styles_row.addWidget(QLabel(text))
+            styles_row.addWidget(combo, 1)
+            combo.currentTextChanged.connect(self._update_style_info)
 
         def row(edit: QLineEdit, browse) -> QHBoxLayout:
             h = QHBoxLayout()
@@ -92,6 +99,8 @@ class NewProjectDialog(QDialog):
         form.addRow("影片或音檔", row(self.media_edit, self._browse_media))
         form.addRow("樣板 ASS", row(self.template_edit, self._browse_template))
         form.addRow("", self.template_info)
+        form.addRow("歌詞樣式", styles_row)
+        form.addRow("", self.style_info)
         form.addRow("新的 ASS 存到", row(self.out_edit, self._browse_out))
         lay = QVBoxLayout(w)
         lay.addWidget(_hint("樣板 ASS：拿一首做好的歌的 ASS，新檔案會沿用它的樣式和 template／code 行"
@@ -150,6 +159,33 @@ class NewProjectDialog(QDialog):
         self.template = doc
         self.template_info.setText(("" if text else "內建預設樣板　｜　")
                                    + f"樣式：{'、'.join(styles)}　｜　template／code 行：{n_tpl} 行")
+        self._fill_styles(doc)
+
+    def _fill_styles(self, doc: AssDocument) -> None:
+        """The lyric style choices, keeping what was picked when the new template has it too."""
+        names = lyric_styles(doc.style_names())
+        for combo, value in zip((self.odd_combo, self.even_combo, self.single_combo), default_styles(doc)):
+            keep = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(names)
+            combo.setCurrentText(keep if keep in names else value)
+            combo.blockSignals(False)
+        self._update_style_info()
+
+    def _update_style_info(self) -> None:
+        if self.template is None:
+            self.style_info.setText("")
+            return
+        covered, every = template_styles(self.template)
+        picked = [c.currentText() for c in (self.odd_combo, self.even_combo, self.single_combo)]
+        missing = [] if every else [n for n in dict.fromkeys(picked) if n not in covered]
+        text = ("雙排版面的奇數行、偶數行，和單獨出現的行（單排版面也用它）的樣式，之後可以在「③ 版面與輸出」改。"
+                + (f"有 template 行的樣式：{'、'.join(covered)}。" if covered and not every else ""))
+        if missing:
+            text += (f"<br><span style='color:#ffcc33'>{'、'.join(missing)} 沒有 template 行，"
+                     "這個樣式的行套樣板不會有效果。</span>")
+        self.style_info.setText(text)
 
     def _paths(self) -> tuple[Path, Path]:
         """(media, new ASS) as absolute paths."""
@@ -397,17 +433,17 @@ class NewProjectDialog(QDialog):
             QMessageBox.warning(self, "建立專案", err)
             return
         media, out = self._paths()
-        data = new_project_bytes(self.template, media, out, texts)
+        odd, even, single = (c.currentText() for c in (self.odd_combo, self.even_combo, self.single_combo))
+        data = new_project_bytes(self.template, media, out, texts, odd or None)
         try:
             with open(out, "xb") as f:         # never overwrite
                 f.write(data)
             doc = AssDocument(data, out)
             ctrl = Controller(doc, self.settings, progress_path_for(out))
-            styles = doc.style_names()
             p = ctrl.layout_params
-            p.odd_style = pick_style(styles, ODD_STYLES)
-            p.even_style = pick_style(styles, EVEN_STYLES + (p.odd_style,))
-            p.single_style = p.one_style = pick_style(styles, SINGLE_STYLES + (p.odd_style,))
+            p.odd_style, p.even_style, p.single_style = (v or d for v, d in zip((odd, even, single),
+                                                                               default_styles(doc)))
+            p.one_style = p.single_style
             ctrl.layout_on = True
             ctrl.save_progress()
         except OSError as e:
