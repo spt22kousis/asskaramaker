@@ -53,38 +53,33 @@ class TapMachine:
         self.next = 0
         self.held: dict[object, int] = {}
         self._open: int | None = None   # started but not yet ended
+        # Which event set each start / end (indices into self.events), so they can be moved.
+        self.start_ev: list[int | None] = [None] * self.n
+        self.end_ev: list[int | None] = [None] * self.n
 
     # -- event entry points ------------------------------------------------
     def down(self, key, t: float) -> int | None:
         """Returns the target index started by this press, or None if ignored."""
         if key in self.held or self.next >= self.n:
             return None   # OS key repeat, or nothing left to tap
-        ev = TapEvent("down", key, t)
-        self.events.append(ev)
-        return self._apply(ev)
+        return self._log(TapEvent("down", key, t))
 
     def up(self, key, t: float) -> int | None:
         """Returns the target index ended by this release, if any."""
         if key not in self.held:
             return None
-        ev = TapEvent("up", key, t)
-        self.events.append(ev)
-        return self._apply(ev)
+        return self._log(TapEvent("up", key, t))
 
     def end_key(self, t: float) -> int | None:
         if self._open is None:
             return None
-        ev = TapEvent("end", None, t)
-        self.events.append(ev)
-        return self._apply(ev)
+        return self._log(TapEvent("end", None, t))
 
     def skip_to(self, target: int) -> None:
         """Leave targets before `target` untapped and continue from there."""
         if target <= self.next:
             return
-        ev = TapEvent("skip", to=min(target, self.n))
-        self.events.append(ev)
-        self._apply(ev)
+        self._log(TapEvent("skip", to=min(target, self.n)))
 
     def undo(self) -> tuple[int, float] | None:
         """Drop the last press (and everything after it).
@@ -95,26 +90,43 @@ class TapMachine:
             if self.events[k].kind == "down":
                 undone = self.events[k]
                 self.events = self.events[:k]
-                self._reset()
-                for ev in self.events:
-                    self._apply(ev)
+                self._replay()
                 return self.next, undone.t
         return None
 
+    def move(self, i: int, edge: str, t: float) -> None:
+        """Move target i's 'start' or 'end' to t by changing the press or release that set it."""
+        k = (self.start_ev if edge == "start" else self.end_ev)[i]
+        if k is None:
+            raise ValueError(f"target {i} has no {edge}")
+        self.events[k].t = t
+        self._replay()
+
     # -- internals -----------------------------------------------------------
 
-    def _close_open(self, t: float) -> int | None:
+    def _log(self, ev: TapEvent) -> int | None:
+        self.events.append(ev)
+        return self._apply(ev, len(self.events) - 1)
+
+    def _replay(self) -> None:
+        self._reset()
+        for k, ev in enumerate(self.events):
+            self._apply(ev, k)
+
+    def _close_open(self, t: float, k: int) -> int | None:
         i = self._open
         if i is not None:
             self.end[i] = max(t, self.start[i])
+            self.end_ev[i] = k
             self._open = None
         return i
 
-    def _apply(self, ev: TapEvent) -> int | None:
+    def _apply(self, ev: TapEvent, k: int) -> int | None:
         if ev.kind == "down":
-            self._close_open(ev.t)
+            self._close_open(ev.t, k)
             i = self.next
             self.start[i] = ev.t
+            self.start_ev[i] = k
             self.held[ev.key] = i
             self._open = i
             self.next += 1
@@ -124,10 +136,10 @@ class TapMachine:
             if i is None or i != self._open:
                 return None   # already ended by a later press (overlapping keys)
             if self.mode == HOLD or (self.line_last[i] and self.onset_end == END_RELEASE):
-                return self._close_open(ev.t)
+                return self._close_open(ev.t, k)
             return None
         if ev.kind == "end":
-            return self._close_open(ev.t)
+            return self._close_open(ev.t, k)
         if ev.kind == "skip":
             self._open = None
             self.held.clear()

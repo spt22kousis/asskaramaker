@@ -406,7 +406,7 @@ class LineView(QWidget):
         c = self.ctrl
         if not (0 <= li < len(c.lines)):
             return
-        s, e = c.line_start(li), c.line_end(li)
+        s, e = c.sing_range(li)
         span = max(1.0, e - s)
         frac = (self.song_ms - s) / span
         y = self.height() - 6

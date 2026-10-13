@@ -19,6 +19,8 @@ from ..controller import (IMPORTED, PARTIAL, TAPPED_OK, UNTAPPED, WARNING, Actio
 from ..karaoke import merge_syllables, split_syllable
 from ..lyrics import has_taps, kara_to_editor, make_line, parse_text, to_kara_text
 from ..onsets import detect
+from ..preview import parse_styles, play_res
+from ..project import add_template_lines, default_template, is_template_line
 from ..waveform import envelope
 from ..settings import Settings
 from ..timing import HOLD, KEEP, ONSET, TAPPED
@@ -26,6 +28,7 @@ from .dialogs import CalibrationDialog, CheckDialog, SettingsDialog, ShiftDialog
 from .helpbar import HelpBar, key
 from .layout_page import LayoutPage
 from .line_page import LinePage
+from .preview import PreviewPage
 from .wave import WaveView
 from .widgets import CueWidget, LineView, cue_item, ui_font
 from .wizard import NewProjectDialog
@@ -44,14 +47,15 @@ HELP = """• 打軸鍵：{taps}（可以多鍵交替、雙押）　結束鍵：
 • 空白：播放／暫停　←／→：倒退／前進 2 秒　R：重打這行　Backspace：復原上一下　↑／↓：上一行／下一行　Ctrl+G：跳到第幾行
 • M：長按／起點模式　S：切換速度　P：保持音高　C：逐行／連續　T：行時間模式　Ctrl+L：延遲校正（第一次用建議先做）
 • 切音節：暫停時點目前那行字與字之間（紫線＝可以合併的分界，灰線＝不能合併，點＝可以切開的地方）
-• 微調：暫停時拖曳波形上的邊界（Shift＋拖曳＝行頭／行尾）　點波形＝移動播放位置　V：波形／頻譜
+• 微調：暫停時拖曳波形上的邊界，打到一半也可以（Shift＋拖曳＝行頭／行尾）　點波形＝移動播放位置　V：波形／頻譜
+• 波形：Ctrl＋滾輪＝縮放　滾輪＝左右捲動（換行時回到整行）
 • 在字上按右鍵：從這個音節開始重打（前面的保留）、標記這個音節
 • W：回放檢查（照打好的時間播放，看到不對就按打軸鍵標記）　N：跳到下一個標記，從那裡重打
 • Ctrl+Z／Ctrl+Y：復原／重做任何修改　E：延長選取行的行時間（敲出界時）　Ctrl+S：存進度　Ctrl+E：檢查並匯出　Ctrl+,：設定
 • 行清單按右鍵：修改、拆開、合併、插入、刪除行　Ctrl+T：時間平移（整首或選取的行）"""
 
 
-PAGE_LINES, PAGE_SYLLABLES, PAGE_LAYOUT = 0, 1, 2
+PAGE_LINES, PAGE_SYLLABLES, PAGE_LAYOUT, PAGE_PREVIEW = 0, 1, 2, 3
 
 ABOUT = """<b>karatap</b>　卡拉OK字幕打軸工具<br><br>
 振假名逐字拆分使用 KANJIDIC2 的讀音資料：<br>
@@ -150,8 +154,11 @@ class MainWindow(QMainWindow):
         tl.changed.connect(self._after_line_drag)
         self.onsets = None
         self.bridge.onsets_ready.connect(self._on_onsets)
-        self.bridge.envelope_ready.connect(
-            lambda src, env: tl.set_audio(tl.length_ms, env) if src is self.source else None)
+        self.preview_page = PreviewPage()
+        ptl = self.preview_page.timeline
+        ptl.seek_requested.connect(self.seek_to)
+        ptl.line_activated.connect(lambda li: self.seek_to(max(0.0, self.ctrl.line_start(li) - 500)))
+        self.bridge.envelope_ready.connect(self._on_envelope)
         for v in (self.wave, tl):
             v.set_snap(settings.snap_onsets)
         self._synced_line = self._synced_syl = -1
@@ -164,6 +171,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.line_page, "① 行軸")
         self.tabs.addTab(syllable_page, "② 音節")
         self.tabs.addTab(self.layout_page, "③ 版面與輸出")
+        self.tabs.addTab(self.preview_page, "④ 預覽")
         self.tabs.currentChanged.connect(self._on_tab)
         central = QWidget()
         outer = QVBoxLayout(central)
@@ -307,6 +315,7 @@ class MainWindow(QMainWindow):
         self.line_page.rebuild(ctrl)
         self.line_page.timeline.set_controller(ctrl)
         self.layout_page.set_controller(ctrl)
+        self.preview_page.timeline.set_controller(ctrl)
         self._synced_line = self._synced_syl = -1
         if imported:
             self.statusBar().showMessage(f"有 {imported} 行沿用檔案裡原有的 \\k（◆），重敲或拖曳後才會改", 6000)
@@ -365,7 +374,8 @@ class MainWindow(QMainWindow):
             return
         self.source = src
         self.wave.set_audio(src.base, src.sr)
-        self.line_page.timeline.set_audio(len(src.base) / src.sr * 1000, None)
+        for tl in (self.line_page.timeline, self.preview_page.timeline):
+            tl.set_audio(len(src.base) / src.sr * 1000, None)
         self._start_onsets(src)
         self.apply_variant()
         for sp in self.settings.speeds:     # pre-render the other speeds in the background
@@ -385,6 +395,11 @@ class MainWindow(QMainWindow):
             self.bridge.onsets_ready.emit(src, found)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _on_envelope(self, src, env) -> None:
+        if src is self.source:
+            for tl in (self.line_page.timeline, self.preview_page.timeline):
+                tl.set_audio(tl.length_ms, env)
 
     def _on_onsets(self, src, onsets) -> None:
         if src is not self.source:
@@ -474,6 +489,15 @@ class MainWindow(QMainWindow):
         mods = ev.modifiers() & (Qt.ControlModifier | Qt.AltModifier)
         if mods:
             return False            # menu shortcuts
+        if page == PAGE_PREVIEW:
+            handler = {Qt.Key_Space: self.toggle_play, Qt.Key_Left: lambda: self.nudge(-2000),
+                       Qt.Key_Right: lambda: self.nudge(2000), Qt.Key_Up: lambda: self._preview_step(-1),
+                       Qt.Key_Down: lambda: self._preview_step(1)}.get(key)
+            if handler is None or et != QEvent.KeyPress:
+                return handler is not None
+            if not ev.isAutoRepeat() or key in (Qt.Key_Left, Qt.Key_Right):
+                handler()
+            return True
         tap_keys = {ord(c) for c in self.settings.tap_keys}
         if key in tap_keys:
             if not ev.isAutoRepeat():
@@ -686,8 +710,27 @@ class MainWindow(QMainWindow):
         elif page == PAGE_SYLLABLES:
             self._last_statuses = []
             self.jump(c.cursor, play=False)
-        else:
+        elif page == PAGE_LAYOUT:
             self.layout_page.refresh()
+        else:
+            self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        c = self.ctrl
+        self.preview_page.view.set_content(c.preview_lines(), parse_styles(c.doc), play_res(c.doc))
+        self.preview_page.timeline.update()
+
+    def _preview_step(self, step: int) -> None:
+        """Preview: play from the line before / after the one on screen."""
+        if not self.ctrl or not self.player or not self.variant_key:
+            return
+        starts = sorted({pl.start for pl in self.ctrl.preview_lines()})
+        if not starts:
+            return
+        now = self.player.song_ms()
+        cur = max((k for k, t in enumerate(starts) if t <= now + 50), default=-1)
+        k = max(0, min(cur + step, len(starts) - 1))
+        self.player.seek(max(0.0, starts[k] - 500))
 
     def _after_layout_change(self) -> None:
         self._last_statuses = []
@@ -1064,6 +1107,9 @@ class MainWindow(QMainWindow):
         self.wave.set_controller(c)
         self.view.update()
         self.line_page.timeline.update()
+        self.preview_page.timeline.set_controller(c)
+        if self.tabs.currentIndex() == PAGE_PREVIEW:
+            self._refresh_preview()
         li = max(0, min(li, len(c.lines) - 1))
         if self.tabs.currentIndex() == PAGE_LINES:
             self.jump_line(li)
@@ -1250,8 +1296,13 @@ class MainWindow(QMainWindow):
         c = self.ctrl
         with c.layout_fixed():
             statuses = [c.status(i) for i in range(len(c.lines))]
+        data = c.export_bytes()
+        if not any(is_template_line(e) for e in c.doc.events) and QMessageBox.question(
+                self, "匯出", "這個 ASS 裡沒有 template／code 行，Apply Karaoke Template 不會有效果。\n"
+                "要把內建預設樣板的 template／code 行（和缺少的樣式）加進匯出的檔案嗎？") == QMessageBox.Yes:
+            data = add_template_lines(data, default_template())
         try:
-            out.write_bytes(c.export_bytes())
+            out.write_bytes(data)
         except OSError as e:
             QMessageBox.critical(self, "匯出失敗", f"寫不進 {out.name}：{e}")
             return
@@ -1290,7 +1341,8 @@ class MainWindow(QMainWindow):
             return
         c = self.ctrl
         with c.layout_fixed():
-            statuses = [(c.status(i), c.line_start(i) if not c.layout_on or c.sung_span(i) else None,
+            # with the layout on, when the line is sung (its on-screen time is on the layout page)
+            statuses = [(c.status(i), (c.sung_span(i) or (None,))[0] if c.layout_on else c.line_start(i),
                          len(c.marked(i))) for i in range(len(c.lines))]
         for i, (line, (st, start, marks)) in enumerate(zip(c.lines, statuses)):
             if i < len(self._last_statuses) and self._last_statuses[i] == (st, start, marks):
@@ -1363,6 +1415,10 @@ class MainWindow(QMainWindow):
             self._tick_lines(c, now, playing)
             return
         if page == PAGE_LAYOUT:
+            return
+        if page == PAGE_PREVIEW:
+            self.preview_page.view.set_time(song)
+            self.preview_page.timeline.set_state(song, playing, False, -1)
             return
         up = c.review_upcoming(4) if self.review else c.upcoming(4)
         pressed = (bool(self.held) and s.mode == HOLD and not self.review) or now < self.flash_until

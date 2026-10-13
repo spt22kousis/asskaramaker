@@ -11,6 +11,7 @@ from ..onsets import snap
 from ..waveform import colormap, peaks, spectrogram
 from .widgets import ACTIVE, BG, DIM, DONE, FG, WARN, ui_font
 
+MIN_SPAN_MS = 200     # the closest the wheel zooms in
 GRAB_PX = 7          # how close the mouse must be to a boundary to grab it
 SNAP_PX = 8          # a dragged boundary snaps to an onset this close
 LINE_EDGE = QColor("#e8e8ea")
@@ -35,6 +36,8 @@ class WaveView(QWidget):
         self._range: tuple[float, float] | None = None
         self._drag: tuple[int, Handle] | None = None
         self._frozen: tuple[float, float] | None = None
+        self._zoom: tuple[float, float] | None = None    # a range picked with the wheel, for _zoom_line
+        self._zoom_line = -1
         self.onsets: np.ndarray | None = None
         self.snap_on = False
         self.setMinimumHeight(100)
@@ -66,6 +69,12 @@ class WaveView(QWidget):
 
     def set_state(self, song_ms: float, editable: bool) -> None:
         self.song_ms, self.editable = song_ms, editable
+        if self._zoom and not editable:          # playing while zoomed in: turn the page
+            t0, t1 = self._zoom
+            span = t1 - t0
+            if not t0 <= song_ms <= t0 + span * 0.92:
+                t0 = self._clamp(song_ms - span * 0.08, span)
+                self._zoom = (t0, t0 + span)
         if not editable and self._drag:
             self._end_drag()
         self.update()
@@ -77,29 +86,26 @@ class WaveView(QWidget):
             return None
         return c.current_line()
 
-    def _bounds(self, li: int) -> list[tuple[float | None, float | None]]:
-        """Result bounds, or the partial taps of the running take."""
-        c = self.ctrl
-        r = c.results.get(li)
-        if r:
-            return list(r.bounds)
-        t = c.take
-        if t and li in t.first_target:
-            m = t.machine
-            return list(t.prefix.get(li, [])) + [(m.start[i], m.end[i]) for i in t.line_targets(li)]
-        return []
-
     def _time_range(self, li: int) -> tuple[float, float]:
         if self._frozen:
             return self._frozen
+        if self._zoom and self._zoom_line == li:
+            return self._zoom
+        self._zoom = None                       # another line: back to the whole line
         c = self.ctrl
-        lo, hi = float(c.line_start(li)), float(c.line_end(li))
-        for s, e in self._bounds(li):
-            for v in (s, e):
-                if v is not None:
-                    lo, hi = min(lo, v), max(hi, v)
+        lo, hi = c.sing_range(li)
+        values = [v for b in c.tapped_bounds(li) for v in b if v is not None] + list(c.line_edges(li) or ())
+        lo, hi = min([lo, *values]), max([hi, *values])
         pad = max(300.0, (hi - lo) * 0.08)
         return lo - pad, hi + pad
+
+    def _length_ms(self) -> float:
+        return len(self.pcm) / self.sr * 1000 if self.pcm is not None else 0.0
+
+    def _clamp(self, t0: float, span: float) -> float:
+        length = self._length_ms()
+        t0 = max(t0, -1000.0)
+        return min(t0, max(0.0, length - span * 0.5)) if length else t0
 
     def _x(self, ms: float) -> float:
         t0, t1 = self._range
@@ -151,15 +157,15 @@ class WaveView(QWidget):
             p.setPen(DIM)
             p.drawText(self.rect(), Qt.AlignCenter, "載入音訊中…")
         h = self.height()
-        bounds = self._bounds(li)
+        bounds = c.tapped_bounds(li)
         line = c.lines[li]
-        L0, L1 = c.line_start(li), c.line_end(li)
+        edges = c.line_edges(li)
 
         # Shade what isn't sung: gaps between syllables (or, before any taps, outside the line).
         spans = sorted((self._x(s), self._x(e if e is not None else max(s, self.song_ms)))
                        for s, e in bounds if s is not None)
         if not spans:
-            spans = [(self._x(L0), self._x(L1))]
+            spans = [tuple(self._x(v) for v in (edges or c.sing_range(li)))]
         p.setPen(Qt.NoPen)
         p.setBrush(GAP_SHADE)
         x_prev = 0.0
@@ -200,10 +206,11 @@ class WaveView(QWidget):
             if e is not None:
                 p.setPen(QPen(DONE, 1.5, Qt.DashLine))
                 p.drawLine(QPointF(self._x(e), 0), QPointF(self._x(e), h))
-        status_warn = c.status(li) == "warning"
-        p.setPen(QPen(WARN if status_warn else LINE_EDGE, 2, Qt.DashDotLine))
-        for v in (L0, L1):
-            p.drawLine(QPointF(self._x(v), 0), QPointF(self._x(v), h))
+        if edges:
+            status_warn = c.status(li) == "warning"
+            p.setPen(QPen(WARN if status_warn else LINE_EDGE, 2, Qt.DashDotLine))
+            for v in edges:
+                p.drawLine(QPointF(self._x(v), 0), QPointF(self._x(v), h))
 
         if self._drag:
             hx = self._x(self._drag[1].ms)
@@ -231,7 +238,7 @@ class WaveView(QWidget):
             return None
         hs = self.ctrl.handles(li)
         if prefer_edges:
-            hs = [h for h in hs if h.refs[0][0] in ("L0", "L1")] or hs
+            hs = [h for h in hs if h.refs[0][0] in ("L0", "L1", "T0", "T1")] or hs
         best = min(hs, key=lambda h: abs(self._x(h.ms) - x), default=None)
         if best is None or abs(self._x(best.ms) - x) > GRAB_PX:
             return None
@@ -275,4 +282,24 @@ class WaveView(QWidget):
         self._drag = None
         self._frozen = None
         self.changed.emit(li)
+        self.update()
+
+    def wheelEvent(self, ev) -> None:
+        """Ctrl+wheel zooms around the mouse, the wheel scrolls; another line goes back to the whole line."""
+        d = ev.angleDelta()
+        steps = (d.y() or d.x()) / 120
+        li = self._line()
+        if not steps or self._range is None or self._drag or li is None:
+            return
+        t0, t1 = self._range
+        span = t1 - t0
+        if ev.modifiers() & Qt.ControlModifier:
+            anchor = self._ms(ev.position().x())
+            frac = (anchor - t0) / span
+            span = min(max(span * 0.8 ** steps, MIN_SPAN_MS), max(MIN_SPAN_MS, self._length_ms() or span))
+            t0 = anchor - frac * span
+        else:
+            t0 -= steps * span * 0.15
+        t0 = self._clamp(t0, span)
+        self._zoom, self._zoom_line = (t0, t0 + span), li
         self.update()

@@ -85,6 +85,18 @@ class LineResult:
     source: str = FROM_TAPS              # FROM_FILE: \k already in the ASS, untouched so far
 
 
+@dataclass
+class PreviewLine:
+    """A line as the exported file shows it."""
+    line: int
+    start: int              # ms
+    end: int
+    style: str
+    text: str
+    margins: tuple[int, int, int]      # the event's MarginL / MarginR / MarginV (0 = the style's)
+    timed: bool             # its syllables are tapped (else the \k are placeholders)
+
+
 def file_bounds(line: LineInfo) -> list[tuple[float, float]] | None:
     """Syllable (start, end) from the \\k values already in the ASS, or None if they look like placeholders."""
     start, end = line.event.start_ms, line.event.end_ms
@@ -306,6 +318,24 @@ class Controller:
             return self._added_span(li)[1]
         return self.lines[li].event.end_ms
 
+    def sing_range(self, li: int) -> tuple[float, float]:
+        """Where the line is sung, for tapping its syllables.
+
+        With the layout on, line_start / line_end are when the line is on screen: the
+        first line of a segment shows up early and an even line together with the line
+        before it. Tapping goes by its syllables, else its line tap, instead.
+        """
+        if not self.layout_on:
+            return self.line_start(li), self.line_end(li)
+        return self.sung_span(li) or self._layout_span(li)
+
+    def line_edges(self, li: int) -> tuple[float, float] | None:
+        """The line's start / end shown on the waveform: with the layout on, its line tap
+        until the syllables are done (they decide the line then)."""
+        if not self.layout_on:
+            return self.line_start(li), self.line_end(li)
+        return self.line_taps.get(li) if self.line_draggable(li) else None
+
     @staticmethod
     def _gap_span(li: int, spans: list) -> tuple[float, float]:
         """For a line without times: the gap between its timed neighbours."""
@@ -381,7 +411,7 @@ class Controller:
         self.dirty = True
 
     def preroll_target(self, li: int) -> float:
-        return max(0.0, self.line_start(li) - self.settings.preroll_ms)
+        return max(0.0, self.sing_range(li)[0] - self.settings.preroll_ms)
 
     # -- results -----------------------------------------------------------------
     def timing_for(self, li: int) -> LineTiming | None:
@@ -435,21 +465,46 @@ class Controller:
         self.dirty = True
 
     # -- dragging boundaries on the waveform --------------------------------------------
-    def handles(self, li: int) -> list[Handle]:
+    def _partial(self, li: int) -> tuple[Take, range] | None:
+        """The running take and its targets on line li, while it has tapped some of them but not all."""
+        t = self.take
+        if t is None or li not in t.first_target or li in t.committed:
+            return None
+        rng = t.line_targets(li)
+        if not any(t.machine.start[i] is not None for i in rng):
+            return None
+        return t, rng
+
+    def tapped_bounds(self, li: int) -> list[tuple[float, float | None]]:
+        """The line's syllable (start, end): what the running take has tapped of it so far
+        (the last end is None while that syllable is still going), else its result."""
+        part = self._partial(li)
+        if part:
+            t, rng = part
+            m = t.machine
+            return list(t.prefix.get(li, [])) + [(m.start[i], m.end[i]) for i in rng if m.start[i] is not None]
         r = self.results.get(li)
-        if not r:
-            return []
-        b = r.bounds
+        return list(r.bounds) if r else []
+
+    def handles(self, li: int) -> list[Handle]:
+        b = self.tapped_bounds(li)
         out: list[Handle] = []
         for j, (s, e) in enumerate(b):
+            hi = math.inf if e is None else e
             if j and abs(b[j - 1][1] - s) < 1.0:            # previous end == this start: one handle
-                out.append(Handle(s, b[j - 1][0], e, (("e", j - 1), ("s", j))))
+                out.append(Handle(s, b[j - 1][0], hi, (("e", j - 1), ("s", j))))
                 continue
             if j:
                 out.append(Handle(b[j - 1][1], b[j - 1][0], s, (("e", j - 1),)))
-            out.append(Handle(s, b[j - 1][1] if j else 0.0, e, (("s", j),)))
-        out.append(Handle(b[-1][1], b[-1][0], math.inf, (("e", len(b) - 1),)))
-        if self.settings.line_timing == KEEP or self.layout_on:
+            out.append(Handle(s, b[j - 1][1] if j else 0.0, hi, (("s", j),)))
+        if b and b[-1][1] is not None:
+            out.append(Handle(b[-1][1], b[-1][0], math.inf, (("e", len(b) - 1),)))
+        if self.layout_on:
+            if self.line_draggable(li):                     # the line tap from the line page
+                s, e = self.line_taps[li]
+                out.append(Handle(s, 0.0, e - MIN_LINE_MS, (("T0",),)))
+                out.append(Handle(e, s + MIN_LINE_MS, math.inf, (("T1",),)))
+        elif self.settings.line_timing == KEEP and li in self.results and not self._partial(li):
             out.append(Handle(self.line_start(li), 0.0, b[0][0], (("L0",),)))
             out.append(Handle(self.line_end(li), b[-1][1], math.inf, (("L1",),)))
         return out
@@ -460,22 +515,30 @@ class Controller:
 
     def move_handle(self, li: int, h: Handle, ms: float) -> float:
         """Move a boundary (10 ms steps, kept between its neighbours). Returns where it landed."""
-        r = self.results[li]
         ms = min(max(round(ms / 10) * 10, h.lo), h.hi)
+        kind = h.refs[0][0]
+        if kind in ("T0", "T1"):
+            self.line_take = None           # its replay log would bring the old times back
+            return self.move_line_edge(li, "start" if kind == "T0" else "end", ms)
+        part = self._partial(li)
+        if part:                            # paused halfway through the line: move the taps themselves
+            t, rng = part
+            prefix = t.prefix.get(li, [])
+            for kind, j in h.refs:
+                edge = "start" if kind == "s" else "end"
+                if j < len(prefix):
+                    a, b = prefix[j]
+                    prefix[j] = (ms, b) if edge == "start" else (a, ms)
+                else:
+                    t.machine.move(rng[j - len(prefix)], edge, ms)
+            return ms
+        r = self.results[li]
         ev = self.lines[li].event
-        p = self.placements()[li] if self.layout_on else None
         for ref in h.refs:
             if ref[0] == "s":
                 r.bounds[ref[1]] = (ms, r.bounds[ref[1]][1])
             elif ref[0] == "e":
                 r.bounds[ref[1]] = (r.bounds[ref[1]][0], ms)
-            elif p is not None:                 # the layout's line edges: a manual override
-                s, e = self.layout_overrides.get(li, (None, None))
-                if ref[0] == "L0":
-                    s = None if ms == to_cs(p.start) * 10 else int(ms)
-                else:
-                    e = None if ms == to_cs(p.end) * 10 else int(ms)
-                self.set_layout_override(li, s, e)
             elif ref[0] == "L0":
                 r.start_override = None if ms == ev.start_ms else int(ms)
             else:
@@ -775,6 +838,8 @@ class Controller:
         if t is None:
             return self.cursor
         m = t.machine
+        if m.open_target is not None:           # a syllable still going: its line until it ends
+            return t.targets[m.open_target][0]
         if m.next < len(t.targets):
             return t.targets[m.next][0]
         return t.targets[-1][0] if t.targets else self.cursor
@@ -897,7 +962,7 @@ class Controller:
         if any(take.machine.start[i] is not None for i in take.line_targets(nxt)):
             return None          # already tapping the next line
         target = self.preroll_target(nxt)
-        if now_ms < target or now_ms > self.line_start(nxt) - 100:
+        if now_ms < target or now_ms > self.sing_range(nxt)[0] - 100:
             return Action("seek", target, nxt)
         return None
 
@@ -912,13 +977,13 @@ class Controller:
         m = take.machine
         touched = any(m.start[i] is not None for i in take.line_targets(li))
         if self.settings.continuous:
-            if not touched and now_ms > self.line_end(li) + SKIP_GRACE_MS:
+            if not touched and now_ms > self.sing_range(li)[1] + SKIP_GRACE_MS:
                 nxt = li + 1
                 if nxt in take.first_target:
                     m.skip_to(take.first_target[nxt])
                     self.cursor = nxt
             return None
-        if now_ms > self.line_end(li) + LOOP_GRACE_MS:
+        if now_ms > self.sing_range(li)[1] + LOOP_GRACE_MS:
             punch = take.punch if take.punch and take.punch[0] == li else None
             self.start_take(li, punch[1] if punch else None)
             return Action("seek", self.take_seek_target(), li)
@@ -1155,9 +1220,17 @@ class Controller:
     def _render(self, li: int, placements: list[Placement | None] | None) -> str | None:
         """Line li as it goes into the exported file; None when the file's line stays as it is."""
         line = self.lines[li]
+        new_ev = self._export_event(li, placements)
+        if new_ev is None:
+            return None
+        text = new_ev.render()
+        return None if not line.added and text == self.doc.lines[line.event.line_no] else text
+
+    def _export_event(self, li: int, placements: list[Placement | None] | None) -> Event | None:
+        """Line li's event in the exported file; None when the file's line stays as it is."""
+        line = self.lines[li]
         ev = line.event
         timing = self.timing_for(li)
-        original = None if line.added else self.doc.lines[ev.line_no]
 
         def times(start: float, end: float) -> dict:
             return {"start": format_time(start, like=ev.get("start")),
@@ -1192,8 +1265,26 @@ class Controller:
                 if line.added or timing.end_cs * 10 != ev.end_ms:
                     changes["end"] = format_time(timing.end_cs * 10, like=ev.get("end"))
             new_ev = ev.with_fields(**changes)
-        text = new_ev.render()
-        return None if text == original else text
+        return new_ev
+
+    def preview_lines(self) -> list[PreviewLine]:
+        """Every line as the exported file will show it (lines the layout leaves out are skipped)."""
+        out = []
+        with self.layout_fixed():
+            placements = self.placements() if self.layout_on else None
+            for li, line in enumerate(self.lines):
+                if placements is not None and placements[li] is None:
+                    continue
+                ev = self._export_event(li, placements) or line.event
+                margins = []
+                for name in ("marginl", "marginr", "marginv"):
+                    try:
+                        margins.append(int(ev.get(name) or 0))
+                    except ValueError:          # no such field, or not a number
+                        margins.append(0)
+                out.append(PreviewLine(li, ev.start_ms, ev.end_ms, ev.style, ev.text, tuple(margins),
+                                       li in self.results))
+        return out
 
     def export_bytes(self) -> bytes:
         with self.layout_fixed():

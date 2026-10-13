@@ -84,23 +84,22 @@ def test_export_uses_layout_times_styles_and_lead_in(tmp_path):
     assert ev[2].render() == doc.karaoke_events()[2].render()
 
 
-def test_override_and_drag_handles(tmp_path):
+def test_line_edges_on_the_waveform_are_the_line_tap(tmp_path):
     doc, c = project(tmp_path)
     hold(c, "F", 10000, 12000)
     c.start_take(0)
+    t0 = [h for h in c.handles(0) if h.refs == (("T0",),)][0]
+    assert t0.ms == 10000
+    c.begin_drag(0)
+    assert c.move_handle(0, t0, 9500) == 9500
+    assert c.line_taps[0] == (9500, 12000) and not c.layout_overrides
+    c.undo_edit()
+    assert c.line_taps[0] == (10000, 12000)
+    # once the syllables are done they decide the line: no line edges to drag here
+    c.start_take(0)
     hold(c, "F", 10200, 10900, line=False)
     hold(c, "J", 11000, 11800, line=False)
-    l0 = [h for h in c.handles(0) if h.refs == (("L0",),)][0]
-    assert l0.ms == 10200                 # alone in its segment: shown when sung
-    c.begin_drag(0)
-    assert c.move_handle(0, l0, 9500) == 9500
-    assert c.layout_overrides[0] == (9500, None)
-    assert c.line_start(0) == 9500
-    c.move_handle(0, l0, 10200)           # back to the rule's value: no override
-    assert 0 not in c.layout_overrides
-    c.move_handle(0, l0, 9600)
-    c.undo_edit()
-    assert 0 not in c.layout_overrides
+    assert [h.refs[0][0] for h in c.handles(0)] == ["s", "e", "s", "e"]
 
 
 def test_progress_round_trip(tmp_path):

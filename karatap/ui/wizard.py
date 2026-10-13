@@ -13,7 +13,8 @@ from ..ass_doc import AssDocument
 from ..controller import Controller, progress_path_for
 from ..lyrics import (LLM_READINGS_PROMPT, LyricLine, fetch_url, has_taps, make_line, parse_any,
                       parse_text, plain_text, to_editor_text, to_kara_text)
-from ..project import is_template_line, new_project_bytes, pick_style
+from ..project import (EVEN_STYLES, ODD_STYLES, SINGLE_STYLES, default_template, is_template_line,
+                       new_project_bytes, pick_style)
 from ..settings import Settings
 from .lyrics_view import LyricsView, counts, option_label
 from .widgets import ui_font
@@ -75,6 +76,7 @@ class NewProjectDialog(QDialog):
         w = QWidget()
         self.media_edit = QLineEdit()
         self.template_edit = QLineEdit(self.settings.last_template)
+        self.template_edit.setPlaceholderText("空白＝內建預設樣板")
         self.out_edit = QLineEdit()
         self.template_info = _hint("")
 
@@ -93,12 +95,11 @@ class NewProjectDialog(QDialog):
         form.addRow("新的 ASS 存到", row(self.out_edit, self._browse_out))
         lay = QVBoxLayout(w)
         lay.addWidget(_hint("樣板 ASS：拿一首做好的歌的 ASS，新檔案會沿用它的樣式和 template／code 行"
-                            "（舊歌的歌詞和特效行不會帶過來）。樣板檔本身不會被改動。"))
+                            "（舊歌的歌詞和特效行不會帶過來）。樣板檔本身不會被改動。空白就用內建的預設樣板。"))
         lay.addLayout(form)
         lay.addStretch(1)
         self.template_edit.editingFinished.connect(self._load_template)
-        if self.template_edit.text():
-            self._load_template()
+        self._load_template()
         return w
 
     def _browse_media(self) -> None:
@@ -131,12 +132,13 @@ class NewProjectDialog(QDialog):
 
     def _load_template(self) -> None:
         self.template = None
-        path = Path(self.template_edit.text().strip())
-        if not path.is_file():
+        text = self.template_edit.text().strip()
+        path = Path(text)
+        if text and not path.is_file():
             self.template_info.setText("")
             return
         try:
-            doc = AssDocument.load(path)
+            doc = AssDocument.load(path) if text else default_template()
         except OSError as e:
             self.template_info.setText(f"讀不到：{e}")
             return
@@ -146,7 +148,8 @@ class NewProjectDialog(QDialog):
             self.template_info.setText("這個檔案裡沒有樣式，不能當樣板。")
             return
         self.template = doc
-        self.template_info.setText(f"樣式：{'、'.join(styles)}　｜　template／code 行：{n_tpl} 行")
+        self.template_info.setText(("" if text else "內建預設樣板　｜　")
+                                   + f"樣式：{'、'.join(styles)}　｜　template／code 行：{n_tpl} 行")
 
     def _paths(self) -> tuple[Path, Path]:
         """(media, new ASS) as absolute paths."""
@@ -402,9 +405,9 @@ class NewProjectDialog(QDialog):
             ctrl = Controller(doc, self.settings, progress_path_for(out))
             styles = doc.style_names()
             p = ctrl.layout_params
-            p.odd_style = pick_style(styles, ("Odd",))
-            p.even_style = pick_style(styles, ("Even", p.odd_style))
-            p.single_style = p.one_style = pick_style(styles, ("Default", p.odd_style))
+            p.odd_style = pick_style(styles, ODD_STYLES)
+            p.even_style = pick_style(styles, EVEN_STYLES + (p.odd_style,))
+            p.single_style = p.one_style = pick_style(styles, SINGLE_STYLES + (p.odd_style,))
             ctrl.layout_on = True
             ctrl.save_progress()
         except OSError as e:
