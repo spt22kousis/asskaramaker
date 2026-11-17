@@ -127,8 +127,27 @@ def test_default_template_styles_for_the_layout():
     names = doc.style_names()
     assert (pick_style(names, ODD_STYLES), pick_style(names, EVEN_STYLES), pick_style(names, SINGLE_STYLES)) == \
         ("K1", "K2", "K0")
-    assert sum(is_template_line(e) for e in doc.events) == 13
+    assert sum(is_template_line(e) for e in doc.events) == 14
     assert not [e for e in doc.events if not is_template_line(e)]
+
+
+def test_default_template_never_shows_a_line_before_the_line_above():
+    # Each row looks 5 s back for its own last line, so after a pause the second line of a
+    # segment could count as following on and fade in before the first. Both base templates
+    # use `appear`, which a code line keeps no earlier than the previous line's.
+    events = default_template().events
+    once = [e.text for e in events if e.effect.startswith("code once")]
+    assert once and once[0].endswith("lastappear = nil")
+    code = [i for i, e in enumerate(events) if e.effect == "code line all" and "lastappear" in e.text]
+    assert len(code) == 1
+    assert "if lastappear and appear < lastappear then appear = lastappear end" in events[code[0]].text
+    # after the line that sets fxgroup.has_prevline, before the first template
+    fxgroup = next(i for i, e in enumerate(events) if e.text.startswith("fxgroup.has_prevline ="))
+    first_template = next(i for i, e in enumerate(events) if e.effect.startswith("template"))
+    assert fxgroup < code[0] < first_template
+    base =[e for e in events if e.effect.startswith("template") and e.get("name") == "base"
+            and e.effect.split()[4] in ("firstline", "has_prevline")]
+    assert len(base) == 2 and all(e.text.startswith('!retime("abs",appear,line.end_time+500)!') for e in base)
 
 
 def test_new_project_from_the_default_template(tmp_path):
@@ -142,7 +161,7 @@ def test_template_lines_added_on_export():
     data = add_template_lines(bare.raw, default_template())
     out = AssDocument(data)
     tpl = [e for e in out.events if is_template_line(e)]
-    assert len(tpl) == 13 and tpl[0].line_no < out.karaoke_events()[0].line_no
+    assert len(tpl) == 14 and tpl[0].line_no < out.karaoke_events()[0].line_no
     assert out.style_names() == ["Default", "Odd", "Even", "noK-furigana", "K2-furigana", "K1-furigana",
                                  "K1", "K2", "noK", "K0"]
     assert [e.text for e in out.karaoke_events()] == [e.text for e in bare.karaoke_events()]
