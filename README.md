@@ -14,15 +14,24 @@
 想確認環境沒問題，可以執行 `karatap.exe --selftest report.txt`，結果會寫進 `report.txt`，最後一行是 `OK` 就沒問題。
 
 ### 從原始碼執行
-需要 Python 3.13（其他版本沒測過）和 ffmpeg。
+需要 Python 3.13（其他版本沒測過）、ffmpeg 和 [uv](https://docs.astral.sh/uv/)（`winget install astral-sh.uv`）。
+
+```bash
+uv sync
+uv run -m karatap
+```
+
+也可以直接帶檔案：`uv run -m karatap 歌詞.ass 影片.mp4`。
+
+沒有 uv 的話，也可以用 pip 裝 `requirements.txt`（由 `uv.lock` 匯出，版本相同）：
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install PySide6 sounddevice numpy
+.venv/Scripts/pip install -r requirements.txt
 .venv/Scripts/python -m karatap
 ```
 
-也可以直接帶檔案：`.venv/Scripts/python -m karatap 歌詞.ass 影片.mp4`。
+改過依賴後要重新匯出：`uv export --format requirements-txt --no-hashes -o requirements.txt`。
 
 ## 整體流程
 
@@ -283,8 +292,7 @@ python -m venv .venv
 ## 開發
 
 ```bash
-.venv/Scripts/python -m pip install pytest
-.venv/Scripts/python -m pytest
+uv run pytest
 ```
 
 測試不需要音效卡（計時邏輯和播放是分開的）。程式結構：
@@ -306,10 +314,10 @@ python -m venv .venv
 | `karatap/controller.py` | 打軸流程、進度檔、匯出 |
 | `karatap/ui/` | PySide6 介面 |
 
-打包 Windows 版（需要先在 venv 裝 PyInstaller）：
+打包 Windows 版（PyInstaller 已在 dev 依賴裡，`uv sync` 就會裝）：
 
 ```bash
-.venv/Scripts/python packaging/build_windows.py v0.2.0
+uv run packaging/build_windows.py v0.2.0
 ```
 
 會產生 `dist/karatap-v0.2.0-windows-x64.zip`。
