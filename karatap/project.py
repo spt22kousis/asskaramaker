@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 
 from .ass_doc import _SECTION_RE, DEFAULT_EVENT_FORMAT, AssDocument, Event
@@ -80,9 +81,38 @@ def pick_style(names: list[str], preferred: tuple[str, ...], fallback: tuple[str
 
 def default_styles(doc: AssDocument) -> tuple[str, str, str]:
     """(odd, even, single) for a new project: the usual names, else the styles that have templates."""
-    names, fallback = doc.style_names(), tuple(template_styles(doc)[0])
+    return _pick_three(doc.style_names(), tuple(template_styles(doc)[0]))
+
+
+def _pick_three(names: list[str], fallback: tuple[str, ...] = ()) -> tuple[str, str, str]:
     odd = pick_style(names, ODD_STYLES, fallback)
     return odd, pick_style(names, EVEN_STYLES + (odd,)), pick_style(names, SINGLE_STYLES + (odd,))
+
+
+@lru_cache(maxsize=1)
+def _default_template_styles() -> tuple[str, ...]:
+    return tuple(default_template().style_names())
+
+
+def offers_default_template(doc: AssDocument) -> bool:
+    """A file without template / code lines: export offers to add the built-in template's, and its styles."""
+    return not any(is_template_line(e) for e in doc.events)
+
+
+def available_styles(doc: AssDocument) -> list[str]:
+    """The styles the exported file can have: its own, then the built-in template's that export offers to add."""
+    names = doc.style_names()
+    if offers_default_template(doc):
+        names += [n for n in _default_template_styles() if n not in names]
+    return names
+
+
+def layout_styles(doc: AssDocument) -> tuple[str, str, str]:
+    """(odd, even, single) for the layout of a file opened as it is. A file without template lines and
+    without the usual odd style gets the built-in template's, which export offers to add with its templates."""
+    if offers_default_template(doc) and not set(ODD_STYLES) & set(doc.style_names()):
+        return _pick_three(list(_default_template_styles()))
+    return default_styles(doc)
 
 
 def karaoke_event(fmt: list[str], style: str, text: str) -> str:

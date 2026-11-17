@@ -20,7 +20,7 @@ from ..karaoke import merge_syllables, split_syllable
 from ..lyrics import has_taps, kara_to_editor, make_line, parse_text, to_kara_text
 from ..onsets import detect
 from ..preview import parse_styles, play_res
-from ..project import add_template_lines, default_template, is_template_line
+from ..project import add_template_lines, default_template, offers_default_template
 from ..waveform import envelope
 from ..settings import Settings
 from ..timing import HOLD, KEEP, ONSET, TAPPED
@@ -717,7 +717,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_preview(self) -> None:
         c = self.ctrl
-        self.preview_page.view.set_content(c.preview_lines(), parse_styles(c.doc), play_res(c.doc))
+        styles = parse_styles(c.doc)
+        if offers_default_template(c.doc):         # export offers to add the built-in template's styles
+            styles = {**parse_styles(default_template()), **styles}
+        self.preview_page.view.set_content(c.preview_lines(), styles, play_res(c.doc))
         self.preview_page.timeline.update()
 
     def _preview_step(self, step: int) -> None:
@@ -1297,10 +1300,15 @@ class MainWindow(QMainWindow):
         with c.layout_fixed():
             statuses = [c.status(i) for i in range(len(c.lines))]
         data = c.export_bytes()
-        if not any(is_template_line(e) for e in c.doc.events) and QMessageBox.question(
-                self, "匯出", "這個 ASS 裡沒有 template／code 行，Apply Karaoke Template 不會有效果。\n"
-                "要把內建預設樣板的 template／code 行（和缺少的樣式）加進匯出的檔案嗎？") == QMessageBox.Yes:
-            data = add_template_lines(data, default_template())
+        if offers_default_template(c.doc):
+            have = set(c.doc.style_names())
+            needed = sorted({e.style for e in AssDocument(data).karaoke_events()} - have)
+            also = (f"\n歌詞行用的樣式 {'、'.join(needed)} 也在內建樣板裡，選「否」的話檔案裡不會有這些樣式。"
+                    if needed else "")
+            if QMessageBox.question(
+                    self, "匯出", "這個 ASS 裡沒有 template／code 行，Apply Karaoke Template 不會有效果。\n"
+                    "要把內建預設樣板的 template／code 行（和缺少的樣式）加進匯出的檔案嗎？" + also) == QMessageBox.Yes:
+                data = add_template_lines(data, default_template())
         try:
             out.write_bytes(data)
         except OSError as e:

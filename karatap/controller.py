@@ -20,7 +20,7 @@ from pathlib import Path
 from .ass_doc import AssDocument, Event, format_time
 from .karaoke import Furi, KaraLine, furigana_for
 from .layout import LayoutParams, Placement, place
-from .project import is_ruby_style, is_template_line, template_styles
+from .project import available_styles, is_ruby_style, is_template_line, layout_styles, template_styles
 from .settings import Settings
 from .timing import KEEP, TAPPED, LineTiming, TapMachine, TimingOptions, compute_line, to_cs
 
@@ -229,7 +229,8 @@ class Controller:
         self.line_cursor = 0
         # Odd/Even layout: when on, line times and styles come from layout.place().
         self.layout_on = False
-        self.layout_params = LayoutParams()
+        odd, even, single = layout_styles(self.doc)
+        self.layout_params = LayoutParams(odd_style=odd, even_style=even, single_style=single, one_style=single)
         self.layout_overrides: dict[int, tuple[int | None, int | None]] = {}   # manual start/end
         # Lines removed in the tool (key -> original text) and the next key for an added line.
         self.deleted: dict[str, str] = {}
@@ -1111,9 +1112,22 @@ class Controller:
             if self.marked(li):
                 out.append(Issue(li, "warn", f"有 {len(self.marked(li))} 個回放時做的標記還沒處理",
                                  min(self.marked(li))))
-        out += self._template_issues(pl)
+        out += self._style_issues(pl) + self._template_issues(pl)
         rank = {"error": 0, "warn": 1, "info": 2}
         return sorted(out, key=lambda i: (rank[i.level], i.line))
+
+    def _style_issues(self, pl) -> list[Issue]:
+        """Lines whose style the exported file won't define: Aegisub shows and templates them with another style."""
+        have = set(available_styles(self.doc))
+        by_style: dict[str, list[int]] = {}
+        for li, line in enumerate(self.lines):
+            style = pl[li].style if pl[li] else line.event.style
+            if style not in have:
+                by_style.setdefault(style, []).append(li)
+        fix = "請在「③ 版面與輸出」換樣式" if self.layout_on else "請開啟版面並選樣式，或在 Aegisub 換樣式"
+        return [Issue(lis[0], "warn", f"樣式「{style}」不在這個 ASS 裡，這個樣式的 {len(lis)} 行在 Aegisub 會改用"
+                                      f"別的樣式顯示和套樣板；{fix}", page="layout")
+                for style, lis in by_style.items()]
 
     def _template_issues(self, pl) -> list[Issue]:
         """Lines whose style no template applies to: Apply Karaoke Template leaves them as they are.
@@ -1123,10 +1137,11 @@ class Controller:
         covered, every = template_styles(self.doc)
         if every:
             return []
+        have = set(self.doc.style_names())          # a missing style has its own warning
         by_style: dict[str, list[int]] = {}
         for li, line in enumerate(self.lines):
             style = pl[li].style if pl[li] else line.event.style
-            if style not in covered:
+            if style not in covered and style in have:
                 by_style.setdefault(style, []).append(li)
         fix = "請在「③ 版面與輸出」換樣式" if self.layout_on else "請開啟版面並選樣式，或匯出後在 Aegisub 換樣式"
         out = []
@@ -1446,6 +1461,27 @@ class Controller:
             self.load_messages.append("ASS 檔在上次存檔後有變動，已依行內容比對進度。")
         if dropped:
             self.load_messages.append(f"有 {dropped} 行的進度對不上目前的 ASS，已略過。")
+        replaced = self._replace_missing_styles()
+        if replaced:
+            self.dirty = True
+            self.load_messages.append("版面用的樣式" + "、".join(f"「{a}」" for a in replaced)
+                                      + "這個 ASS 裡沒有，已改用" + "、".join(f"「{b}」" for b in replaced.values())
+                                      + "，可以在「③ 版面與輸出」換。")
+
+    def _replace_missing_styles(self) -> dict[str, str]:
+        """Layout styles the exported file would not have (e.g. saved before the defaults followed the file)
+        back to the defaults. Returns {old: new}."""
+        have = set(available_styles(self.doc))
+        p = self.layout_params
+        odd, even, single = layout_styles(self.doc)
+        replaced = {}
+        for attr, default in (("odd_style", odd), ("even_style", even), ("single_style", single),
+                              ("one_style", single)):
+            old = getattr(p, attr)
+            if old not in have and default in have:
+                setattr(p, attr, default)
+                replaced[old] = default
+        return replaced
 
     def _apply(self, data: dict) -> int:
         """Load progress_data() into a fresh state. Returns how many records didn't match a line."""

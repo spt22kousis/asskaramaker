@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleS
 
 from ..ass_doc import format_time, parse_time
 from ..controller import Controller
-from ..project import lyric_styles
+from ..project import available_styles, lyric_styles
 from .widgets import ui_font
 
 COLUMNS = ["行", "樣式", "出現", "消失", "開唱", "歌詞"]
@@ -99,7 +99,7 @@ class LayoutPage(QWidget):
         if ctrl is None:
             return
         self._loading = True
-        styles = lyric_styles(ctrl.doc.style_names())
+        styles = lyric_styles(available_styles(ctrl.doc))     # with the built-in template's that export adds
         p = ctrl.layout_params
         self.rows.setCurrentIndex(self.rows.findData(p.rows) if self.rows.findData(p.rows) >= 0 else 0)
         for combo, value in ((self.odd, p.odd_style), (self.even, p.even_style), (self.single, p.single_style),
